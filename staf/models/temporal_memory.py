@@ -150,9 +150,9 @@ class SpatioTemporalMemoryQueue(nn.Module):
         # Project features
         projected = self.feature_proj(fused_features)  # (B, D)
 
-        # FIFO push: shift left and append new frame at the end
+        # FIFO push: shift left (detach history so graph is not retained across batches) and append new frame
         self._queue = torch.cat([
-            self._queue[:, 1:, :],           # Drop oldest
+            self._queue[:, 1:, :].detach(),  # Drop oldest, detach previous graph
             projected.unsqueeze(1),            # Append newest
         ], dim=1)  # (B, T, D)
 
