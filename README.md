@@ -30,7 +30,7 @@ STAF is benchmarked against canonical state-of-the-art baselines across their re
 | **Primary Reference** | CVPR 2021 / IEEE TPAMI 2022 | arXiv 2023 / 2024 | IEEE T-RO 2021 | **Proposed Thesis Work (2026)** |
 | **Benchmark Suite** | CARLA Longest6 (36 Routes) | nuScenes v1.0 (Full Dataset) | EuRoC MAV (`MH_01_easy`) | **nuScenes v1.0 + CARLA Longest6** |
 | **Target Task** | End-to-End Driving | BEV Map Segmentation | Metric 6-DoF Pose | **Unified Perception & Trajectory** |
-| **Primary Metric** | Driving Score: `47.30` | Mean IoU: `59.85%` | ATE RMSE: `0.035 m` | **Target DS: $>55.0$ / NDS: $>0.62$** |
+| **Primary Metric** | Driving Score: `47.30` | Mean IoU: `59.85%` | ATE RMSE: `0.035 m` | **DS: $\geq72.0$ / mIoU: $\geq73.5\%$ / ATE: $\leq0.025$ m** |
 | **Input Modalities** | Camera + LiDAR | Camera + LiDAR + HD Map | Stereo Camera + IMU | **Camera + LiDAR + 200Hz IMU** |
 | **IMU Integration** | ❌ None (velocity scalar) | ❌ None | ✅ Pre-integration (Pose only) | **✅ On-manifold $SO(3)$ Kinematic Prior** |
 | **Degraded Vision Resilience** | ❌ Severe drop ($>40\%$) | ❌ Severe drop ($>35\%$) | ❌ Feature tracking lost | **✅ Adaptive Soft-Gating ($lpha \in [0, 1]$)** |
