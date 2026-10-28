@@ -8,7 +8,8 @@ build/
 *.pt
 *.pth
 *.ckpt
-data/
+# Ignore raw dataset directories at the repo root, but NOT staf/data/ source code
+/data/
 weights/
 runs/
 .DS_Store
