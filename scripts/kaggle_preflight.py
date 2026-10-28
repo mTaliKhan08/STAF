@@ -129,60 +129,67 @@ def run_e2e_smoke_test(device):
 
     criterion = ClassBalancedFocalLoss(num_classes=num_classes, gamma=2.0).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    # Use init_scale=2048.0 to prevent initial FP16 overflow under synthetic inputs
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda"), init_scale=2048.0)
 
-    print("\nCreating synthetic multi-modal batch:")
-    print("  - Camera Image Tensor : (B=4, C=3, H=256, W=256)")
-    print("  - LiDAR BEV Tensor    : (B=4, C=2, H=256, W=256)")
+    print("\nCreating normalized synthetic multi-modal batch:")
+    print("  - Camera Image Tensor : (B=4, C=3, H=256, W=256) in [0, 1]")
+    print("  - LiDAR BEV Tensor    : (B=4, C=2, H=256, W=256) in [0, 1]")
     print("  - IMU Kinematics      : (B=4, 9) [Log(R), v, p]")
     print("  - Ground-truth Labels : (B=4,)")
 
     torch.manual_seed(42)
-    rgb = torch.randn(batch_size, 3, 256, 256, device=device)
-    lidar_bev = torch.randn(batch_size, 2, 256, 256, device=device)
-    x_kinematic = torch.randn(batch_size, 9, device=device)
+    rgb = torch.rand(batch_size, 3, 256, 256, device=device)
+    lidar_bev = torch.rand(batch_size, 2, 256, 256, device=device)
+    x_kinematic = torch.randn(batch_size, 9, device=device) * 0.1
     labels = torch.randint(0, num_classes, (batch_size,), device=device)
 
     model.reset_temporal_state(batch_size, device)
     model.train()
-    optimizer.zero_grad()
 
-    with autocast("cuda", enabled=(device.type == "cuda")):
+    # Run 2 steps to verify AMP GradScaler calibration and gradient flow
+    for step in range(2):
+        optimizer.zero_grad()
+        with autocast("cuda", enabled=(device.type == "cuda")):
+            t0 = time.time()
+            outputs = model(rgb, lidar_bev, x_kinematic)
+            fwd_time = (time.time() - t0) * 1000
+
+            assert "logits" in outputs, "Model output missing 'logits'"
+            assert "w_cam" in outputs, "Model output missing 'w_cam'"
+            assert "w_lidar" in outputs, "Model output missing 'w_lidar'"
+            assert "fused_features" in outputs, "Model output missing 'fused_features'"
+
+            w_cam = outputs["w_cam"]
+            w_lidar = outputs["w_lidar"]
+            loss = criterion(outputs["logits"], labels)
+
+        assert not torch.isnan(loss), "Loss computed is NaN!"
+        assert not torch.isinf(loss), "Loss computed is Inf!"
+
         t0 = time.time()
-        outputs = model(rgb, lidar_bev, x_kinematic)
-        fwd_time = (time.time() - t0) * 1000
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        bwd_time = (time.time() - t0) * 1000
 
-        assert "logits" in outputs, "Model output missing 'logits'"
-        assert "w_cam" in outputs, "Model output missing 'w_cam'"
-        assert "w_lidar" in outputs, "Model output missing 'w_lidar'"
-        assert "fused_features" in outputs, "Model output missing 'fused_features'"
+        if step == 0:
+            print(f"\n[PASS] Forward Pass Completed in {fwd_time:.2f} ms")
+            print(f"  - Output Logits Shape: {outputs['logits'].shape}")
+            print(f"  - w_cam Mean         : {w_cam.mean().item():.4f} (range [{w_cam.min().item():.3f}, {w_cam.max().item():.3f}])")
+            print(f"  - w_lidar Mean       : {w_lidar.mean().item():.4f} (range [{w_lidar.min().item():.3f}, {w_lidar.max().item():.3f}])")
+            print(f"  - Focal Loss Value   : {loss.item():.4f}")
+            print(f"[PASS] Backward Pass & Step Completed in {bwd_time:.2f} ms (GradNorm: {norm:.2f})")
 
-        w_cam = outputs["w_cam"]
-        w_lidar = outputs["w_lidar"]
-        print(f"\n[PASS] Forward Pass Completed in {fwd_time:.2f} ms")
-        print(f"  - Output Logits Shape: {outputs['logits'].shape}")
-        print(f"  - w_cam Mean         : {w_cam.mean().item():.4f} (range [{w_cam.min().item():.3f}, {w_cam.max().item():.3f}])")
-        print(f"  - w_lidar Mean       : {w_lidar.mean().item():.4f} (range [{w_lidar.min().item():.3f}, {w_lidar.max().item():.3f}])")
-
-        loss = criterion(outputs["logits"], labels)
-        print(f"  - Focal Loss Value   : {loss.item():.4f}")
-
-    assert not torch.isnan(loss), "Loss computed is NaN!"
-    assert not torch.isinf(loss), "Loss computed is Inf!"
-
-    t0 = time.time()
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-    bwd_time = (time.time() - t0) * 1000
-    print(f"[PASS] Backward Pass & Optimizer Step Completed in {bwd_time:.2f} ms")
-
+    # Verify all gradients are finite and non-NaN after calibration
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
             assert not torch.isnan(param.grad).any(), f"NaN gradient in {name}!"
             assert not torch.isinf(param.grad).any(), f"Inf gradient in {name}!"
 
-    print("[PASS] Gradient Flow Clean (Zero NaNs, Zero Infs across all backbones and fusion layers)")
+    print("[PASS] Gradient Flow Clean (Zero NaNs, Zero Infs across all backbones, soft-gating & fusion layers)")
 
 def profile_latency_and_memory(device):
     print("\n" + "="*60)
