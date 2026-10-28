@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+    USE_NEW_AMP = True
+except (ImportError, TypeError):
+    from torch.cuda.amp import GradScaler, autocast
+    USE_NEW_AMP = False
 import numpy as np
 
 # Add project root to path
@@ -106,7 +111,8 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        with autocast(device_type="cuda", enabled=scaler.is_enabled()):
+        autocast_ctx = autocast("cuda", enabled=scaler.is_enabled()) if USE_NEW_AMP else autocast(enabled=scaler.is_enabled())
+        with autocast_ctx:
             outputs = model(rgb, lidar_bev, x_kinematic)
 
             if "logits" in outputs:
@@ -214,7 +220,9 @@ def save_checkpoint(
 def main():
     parser = argparse.ArgumentParser(description="STAF Training")
     parser.add_argument("--data-root", type=str, default="", help="Dataset root directory")
-    parser.add_argument("--dataset", type=str, default="nuscenes", choices=["nuscenes", "euroc"])
+    parser.add_argument("--dataset", type=str, default="nuscenes", choices=["nuscenes", "euroc", "synthetic"])
+    parser.add_argument("--smoke-test", action="store_true", help="Run with synthetic data for pipeline validation")
+    parser.add_argument("--no-pretrained", action="store_true", help="Disable downloading pretrained backbone weights")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -236,13 +244,14 @@ def main():
     logger.info(f"Device: {device}")
 
     # --- Build model ---
+    use_pretrained = not (args.smoke_test or args.data_root == "synthetic" or args.dataset == "synthetic" or args.no_pretrained)
     model = STAFModel(
         embed_dim=args.embed_dim,
         num_heads=4,
         num_fusion_layers=args.num_fusion_layers,
         queue_length=args.queue_length,
         num_classes=args.num_classes,
-        pretrained_backbones=True,
+        pretrained_backbones=use_pretrained,
     ).to(device)
 
     param_summary = model.get_param_summary()
@@ -251,23 +260,61 @@ def main():
         logger.info(f"  {k}: {v:,}")
 
     # --- Build dataset ---
-    if args.dataset == "nuscenes":
-        from staf.data.dataset import NuScenesDataset
-        train_dataset = NuScenesDataset(args.data_root, split="train", num_classes=args.num_classes)
-        val_dataset = NuScenesDataset(args.data_root, split="val", num_classes=args.num_classes)
-    elif args.dataset == "euroc":
-        from staf.data.dataset import EuRoCDataset
-        train_dataset = EuRoCDataset(args.data_root, split="train")
-        val_dataset = EuRoCDataset(args.data_root, split="val")
+    if args.smoke_test or args.data_root == "synthetic" or args.dataset == "synthetic":
+        logger.info("SMOKE TEST MODE: Generating synthetic multi-modal data...")
+        from torch.utils.data import TensorDataset
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-    )
+        np.random.seed(args.seed)
+        n_train = 64
+        n_val = 16
+        train_dataset = TensorDataset(
+            torch.randn(n_train, 3, 256, 256),
+            torch.randn(n_train, 2, 256, 256),
+            torch.randn(n_train, 9),
+            torch.randint(0, args.num_classes, (n_train,)),
+        )
+        val_dataset = TensorDataset(
+            torch.randn(n_val, 3, 256, 256),
+            torch.randn(n_val, 2, 256, 256),
+            torch.randn(n_val, 9),
+            torch.randint(0, args.num_classes, (n_val,)),
+        )
+
+        def collate_dict(batch):
+            imgs, lidars, kines, labels = zip(*batch)
+            return {
+                "image": torch.stack(imgs),
+                "lidar_bev": torch.stack(lidars),
+                "x_kinematic": torch.stack(kines),
+                "label": torch.stack(labels),
+            }
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            collate_fn=collate_dict, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_dict,
+        )
+    else:
+        if args.dataset == "nuscenes":
+            from staf.data.dataset import NuScenesDataset
+            train_dataset = NuScenesDataset(args.data_root, split="train", num_classes=args.num_classes)
+            val_dataset = NuScenesDataset(args.data_root, split="val", num_classes=args.num_classes)
+        elif args.dataset == "euroc":
+            from staf.data.dataset import EuRoCDataset
+            train_dataset = EuRoCDataset(args.data_root, split="train")
+            val_dataset = EuRoCDataset(args.data_root, split="val")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+        )
 
     # --- Build loss ---
     criterion = ClassBalancedFocalLoss(
@@ -276,8 +323,8 @@ def main():
 
     # --- Build optimizer & scheduler ---
     optimizer = build_optimizer(model, args.lr, weight_decay=1e-4)
-    scheduler = build_scheduler(optimizer, args.epochs, warmup_epochs=5)
-    scaler = GradScaler(enabled=not args.no_amp)
+    scheduler = build_scheduler(optimizer, args.epochs, warmup_epochs=min(5, max(1, args.epochs // 2)))
+    scaler = GradScaler("cuda", enabled=not args.no_amp) if USE_NEW_AMP else GradScaler(enabled=not args.no_amp)
 
     # --- Resume ---
     start_epoch = 0
