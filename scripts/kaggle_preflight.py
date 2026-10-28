@@ -105,7 +105,7 @@ def run_e2e_smoke_test(device):
         from staf.models.staf_model import STAFModel
         from staf.losses.focal_loss import ClassBalancedFocalLoss
 
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
 
     batch_size = 4
     embed_dim = 256
@@ -129,7 +129,7 @@ def run_e2e_smoke_test(device):
 
     criterion = ClassBalancedFocalLoss(num_classes=num_classes, gamma=2.0).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
     print("\nCreating synthetic multi-modal batch:")
     print("  - Camera Image Tensor : (B=4, C=3, H=256, W=256)")
@@ -147,16 +147,18 @@ def run_e2e_smoke_test(device):
     model.train()
     optimizer.zero_grad()
 
-    with autocast(enabled=(device.type == "cuda")):
+    with autocast("cuda", enabled=(device.type == "cuda")):
         t0 = time.time()
         outputs = model(rgb, lidar_bev, x_kinematic)
         fwd_time = (time.time() - t0) * 1000
 
         assert "logits" in outputs, "Model output missing 'logits'"
-        assert "soft_gating_weights" in outputs, "Model output missing 'soft_gating_weights'"
+        assert "w_cam" in outputs, "Model output missing 'w_cam'"
+        assert "w_lidar" in outputs, "Model output missing 'w_lidar'"
         assert "fused_features" in outputs, "Model output missing 'fused_features'"
 
-        w_cam, w_lidar = outputs["soft_gating_weights"]
+        w_cam = outputs["w_cam"]
+        w_lidar = outputs["w_lidar"]
         print(f"\n[PASS] Forward Pass Completed in {fwd_time:.2f} ms")
         print(f"  - Output Logits Shape: {outputs['logits'].shape}")
         print(f"  - w_cam Mean         : {w_cam.mean().item():.4f} (range [{w_cam.min().item():.3f}, {w_cam.max().item():.3f}])")
