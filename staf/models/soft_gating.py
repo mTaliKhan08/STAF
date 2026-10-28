@@ -87,3 +87,7 @@ class IMUGuidedSoftGating(nn.Module):
     def get_param_count(self) -> int:
         """Return total trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# Canonical alias for compatibility
+DynamicSoftGating = IMUGuidedSoftGating
