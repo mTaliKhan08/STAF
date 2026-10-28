@@ -29,6 +29,15 @@ app = modal.App("staf-ablation-studies")
 data_volume = modal.Volume.from_name("staf-datasets", create_if_missing=True)
 checkpoint_volume = modal.Volume.from_name("staf-checkpoints", create_if_missing=True)
 
+# Locate STAF repo root
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(SCRIPT_DIR, "../staf")):
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF"))
+else:
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
 training_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
@@ -44,21 +53,11 @@ training_image = (
         "einops",
         "nuscenes-devkit",
     )
-)
-
-# Locate STAF repo root
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.exists(os.path.join(SCRIPT_DIR, "../staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF"))
-else:
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-
-staf_mount = modal.Mount.from_local_dir(
-    local_path=staf_local_path,
-    remote_path="/root/STAF",
-    condition=lambda path: "__pycache__" not in path and ".git" not in path,
+    .add_local_dir(
+        staf_local_path,
+        remote_path="/root/STAF",
+        ignore=["**/__pycache__", "**/.git", "**/checkpoints", "**/*.pth", "**/*.pt"],
+    )
 )
 
 
@@ -310,7 +309,7 @@ def _run_ablation(
 @app.function(
     image=training_image, gpu="L4", timeout=43200,
     volumes={"/data": data_volume, "/checkpoints": checkpoint_volume},
-    mounts=[staf_mount], memory=32768,
+    memory=32768,
 )
 def ablation_no_gating(epochs: int = 10, batch_size: int = 8):
     """Ablation 1: STAF without soft-gating (w=1.0 always)."""
@@ -320,7 +319,7 @@ def ablation_no_gating(epochs: int = 10, batch_size: int = 8):
 @app.function(
     image=training_image, gpu="L4", timeout=43200,
     volumes={"/data": data_volume, "/checkpoints": checkpoint_volume},
-    mounts=[staf_mount], memory=32768,
+    memory=32768,
 )
 def ablation_no_temporal(epochs: int = 10, batch_size: int = 8):
     """Ablation 2: STAF without temporal memory queue."""
@@ -330,7 +329,7 @@ def ablation_no_temporal(epochs: int = 10, batch_size: int = 8):
 @app.function(
     image=training_image, gpu="L4", timeout=43200,
     volumes={"/data": data_volume, "/checkpoints": checkpoint_volume},
-    mounts=[staf_mount], memory=32768,
+    memory=32768,
 )
 def ablation_ce_loss(epochs: int = 10, batch_size: int = 8):
     """Ablation 3: STAF with cross-entropy loss (gamma=0)."""
@@ -340,7 +339,7 @@ def ablation_ce_loss(epochs: int = 10, batch_size: int = 8):
 @app.function(
     image=training_image, gpu="L4", timeout=43200,
     volumes={"/data": data_volume, "/checkpoints": checkpoint_volume},
-    mounts=[staf_mount], memory=32768,
+    memory=32768,
 )
 def ablation_noise_inject(epochs: int = 10, batch_size: int = 8):
     """Ablation 4: STAF with injected sensor noise."""

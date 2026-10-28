@@ -36,7 +36,23 @@ app = modal.App("staf-thesis-training")
 data_volume = modal.Volume.from_name("staf-datasets", create_if_missing=True)
 checkpoint_volume = modal.Volume.from_name("staf-checkpoints", create_if_missing=True)
 
-# GPU-ready container image with all dependencies
+# Locate STAF repo root and Baseline repos
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(SCRIPT_DIR, "../staf")):
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF"))
+else:
+    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
+if os.path.exists(os.path.join(SCRIPT_DIR, "../team_code_transfuser")):
+    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+elif os.path.exists(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser")):
+    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser"))
+else:
+    tf_path = None
+
+# GPU-ready container image with all dependencies and local repos mounted (Modal v1.0+ API)
 training_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "wget", "unzip", "libgl1-mesa-glx", "libglib2.0-0")
@@ -53,48 +69,18 @@ training_image = (
         "einops",
         "nuscenes-devkit",
     )
+    .add_local_dir(
+        staf_local_path,
+        remote_path="/root/STAF",
+        ignore=["**/__pycache__", "**/.git", "**/checkpoints", "**/*.pth", "**/*.pt"],
+    )
 )
-
-# Locate STAF repo root and Baseline repos
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.exists(os.path.join(SCRIPT_DIR, "../staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF"))
-else:
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-
-staf_mount = modal.Mount.from_local_dir(
-    local_path=staf_local_path,
-    remote_path="/root/STAF",
-    condition=lambda path: (
-        "__pycache__" not in path
-        and ".git" not in path
-        and "checkpoints" not in path
-    ),
-)
-
-all_mounts = [staf_mount]
-
-# Also mount TransFuser if available
-if os.path.exists(os.path.join(SCRIPT_DIR, "../team_code_transfuser")):
-    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-elif os.path.exists(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser")):
-    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser"))
-else:
-    tf_path = None
 
 if tf_path:
-    all_mounts.append(
-        modal.Mount.from_local_dir(
-            local_path=tf_path,
-            remote_path="/root/Baseline/TransFuser",
-            condition=lambda path: (
-                "__pycache__" not in path
-                and ".git" not in path
-                and "checkpoints" not in path
-            ),
-        )
+    training_image = training_image.add_local_dir(
+        tf_path,
+        remote_path="/root/Baseline/TransFuser",
+        ignore=["**/__pycache__", "**/.git", "**/checkpoints"],
     )
 
 
@@ -110,7 +96,6 @@ if tf_path:
         "/data": data_volume,
         "/checkpoints": checkpoint_volume,
     },
-    mounts=all_mounts,
     memory=32768,  # 32GB RAM
 )
 def train_staf(
@@ -357,7 +342,6 @@ def train_staf(
         "/data": data_volume,
         "/checkpoints": checkpoint_volume,
     },
-    mounts=all_mounts,
     memory=32768,
 )
 def train_transfuser(epochs: int = 20, batch_size: int = 6, accum_steps: int = 4):
@@ -399,7 +383,6 @@ def train_transfuser(epochs: int = 20, batch_size: int = 6, accum_steps: int = 4
         "/data": data_volume,
         "/checkpoints": checkpoint_volume,
     },
-    mounts=all_mounts,
     memory=32768,
 )
 def train_diffuser(epochs: int = 12, batch_size: int = 4):
