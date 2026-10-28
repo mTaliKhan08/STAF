@@ -23,6 +23,14 @@ Prerequisites:
     # Upload datasets to Modal Volume (see scripts/modal_upload_data.py)
 """
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import modal
 import os
 
@@ -45,14 +53,18 @@ elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
 else:
     staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-if os.path.exists(os.path.join(SCRIPT_DIR, "../team_code_transfuser")):
-    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-elif os.path.exists(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser")):
-    tf_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser"))
-else:
-    tf_path = None
+# Locate team_code_transfuser directory (ONLY the Python source code, NEVER .envs or CARLA binaries)
+tf_code_candidates = [
+    os.path.abspath(os.path.join(SCRIPT_DIR, "../team_code_transfuser")),
+    os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser/team_code_transfuser")),
+]
+tf_code_path = None
+for p in tf_code_candidates:
+    if os.path.exists(p) and os.path.exists(os.path.join(p, "train.py")):
+        tf_code_path = p
+        break
 
-# GPU-ready container image with all dependencies and local repos mounted (Modal v1.0+ API)
+# GPU-ready container image with all dependencies and lightweight local repos mounted (Modal v1.0+ API)
 training_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "wget", "unzip", "libgl1-mesa-glx", "libglib2.0-0")
@@ -72,15 +84,15 @@ training_image = (
     .add_local_dir(
         staf_local_path,
         remote_path="/root/STAF",
-        ignore=["**/__pycache__", "**/.git", "**/checkpoints", "**/*.pth", "**/*.pt"],
+        ignore=["**/__pycache__", "**/.git", "**/checkpoints", "**/*.pth", "**/*.pt", "**/runs", "**/weights"],
     )
 )
 
-if tf_path:
+if tf_code_path:
     training_image = training_image.add_local_dir(
-        tf_path,
-        remote_path="/root/Baseline/TransFuser",
-        ignore=["**/__pycache__", "**/.git", "**/checkpoints"],
+        tf_code_path,
+        remote_path="/root/Baseline/TransFuser/team_code_transfuser",
+        ignore=["**/__pycache__", "**/*.pth", "**/*.pt"],
     )
 
 
@@ -120,11 +132,18 @@ def train_staf(
 
     device = torch.device("cuda")
     logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-    logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     from staf.models.staf_model import STAFModel
     from staf.losses.focal_loss import ClassBalancedFocalLoss
-    from torch.cuda.amp import GradScaler, autocast
+    try:
+        from torch.amp import GradScaler, autocast
+        scaler = GradScaler("cuda")
+        amp_ctx = autocast("cuda")
+    except Exception:
+        from torch.cuda.amp import GradScaler, autocast
+        scaler = GradScaler()
+        amp_ctx = autocast()
 
     # Build model
     model = STAFModel(
@@ -157,7 +176,6 @@ def train_staf(
     ], weight_decay=1e-4)
 
     criterion = ClassBalancedFocalLoss(num_classes=num_classes, gamma=gamma).to(device)
-    scaler = GradScaler()
 
     # Auto-resume from checkpoint
     start_epoch = 0
@@ -255,7 +273,7 @@ def train_staf(
             labels = batch["label"].to(device)
 
             optimizer.zero_grad()
-            with autocast(device_type="cuda"):
+            with amp_ctx:
                 outputs = model(rgb, lidar_bev, x_kinematic)
                 loss = (
                     criterion(outputs["logits"], labels)
