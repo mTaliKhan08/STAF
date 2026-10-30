@@ -212,10 +212,24 @@ def train_staf(
             return int(m.group(1)) if m else -1
 
         ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_epoch_*.pth")), key=extract_epoch)
+        latest_file = None
+        latest_epoch = -1
         if ckpts:
-            latest = ckpts[-1]
+            latest_file = ckpts[-1]
+            latest_epoch = extract_epoch(latest_file)
+
+        latest_intra = os.path.join(ckpt_dir, "checkpoint_latest.pth")
+        if os.path.exists(latest_intra):
             try:
-                ckpt = torch.load(latest, map_location=device, weights_only=False)
+                ckpt_temp = torch.load(latest_intra, map_location="cpu", weights_only=False)
+                if ckpt_temp.get("epoch", -1) >= latest_epoch:
+                    latest_file = latest_intra
+            except Exception:
+                pass
+
+        if latest_file:
+            try:
+                ckpt = torch.load(latest_file, map_location=device, weights_only=False)
                 incompatible = model.load_state_dict(ckpt["model_state_dict"], strict=False)
                 if incompatible.missing_keys:
                     logger.info(f"Loaded checkpoint with missing keys: {incompatible.missing_keys}")
@@ -224,11 +238,14 @@ def train_staf(
                         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                     except Exception:
                         logger.warning("Optimizer state not matched, continuing with fresh optimizer")
-                start_epoch = ckpt.get("epoch", 0) + 1
+                if "checkpoint_epoch_" in latest_file:
+                    start_epoch = ckpt.get("epoch", 0) + 1
+                else:
+                    start_epoch = ckpt.get("epoch", 0)
                 best_val_loss = ckpt.get("metrics", {}).get("val_loss", float("inf"))
-                logger.info(f"Resumed from {latest} (epoch {start_epoch})")
+                logger.info(f"Resumed from {latest_file} (epoch {start_epoch})")
             except Exception as e:
-                logger.warning(f"Could not load {latest}: {e}. Starting fresh.")
+                logger.warning(f"Could not load {latest_file}: {e}. Starting fresh.")
 
     # Build dataset
     if smoke_test:
@@ -393,6 +410,18 @@ def train_staf(
                     f"w_cam: {outputs['w_cam'].mean():.3f} "
                     f"w_lidar: {outputs['w_lidar'].mean():.3f}"
                 )
+
+            if batch_idx > 0 and batch_idx % 500 == 0:
+                latest_intra_path = os.path.join(ckpt_dir, "checkpoint_latest.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "batch_idx": batch_idx,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "metrics": {"loss": loss.item()},
+                }, latest_intra_path)
+                checkpoint_volume.commit()
+                logger.info(f"  [Checkpoint Committed] Epoch {epoch} Step {batch_idx}")
 
         # Validation
         model.eval()
