@@ -205,7 +205,13 @@ def train_staf(
 
     if resume:
         import glob
-        ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_epoch_*.pth")))
+        import re
+
+        def extract_epoch(path):
+            m = re.search(r"checkpoint_epoch_(\d+)\.pth", path)
+            return int(m.group(1)) if m else -1
+
+        ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_epoch_*.pth")), key=extract_epoch)
         if ckpts:
             latest = ckpts[-1]
             try:
@@ -333,7 +339,10 @@ def train_staf(
         progress = (epoch - warmup_epochs) / max(epochs - warmup_epochs, 1)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    for g in optimizer.param_groups:
+        g.setdefault("initial_lr", g["lr"])
+    last_epoch = start_epoch - 1 if start_epoch > 0 else -1
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
     # Training loop
     import time
