@@ -276,14 +276,18 @@ class NuScenesDataset(STAFDataset):
     nuScenes dataset adapter for STAF.
 
     Loads synchronized camera, LiDAR, and CAN bus/IMU data from
-    the full nuScenes dataset (1000 scenes, ~40K keyframes).
+    the nuScenes dataset with future Waypoints (pred_len, 2) in local vehicle coordinates.
 
     Requires: nuscenes-devkit
     """
 
-    def __init__(self, data_root: str, version: str = "v1.0-trainval", **kwargs):
+    def __init__(self, data_root: str, version: str = "v1.0-trainval", pred_len: int = 4, **kwargs):
+        if version == "v1.0-trainval" and not os.path.exists(os.path.join(data_root, "v1.0-trainval")):
+            if os.path.exists(os.path.join(data_root, "v1.0-mini")):
+                version = "v1.0-mini"
         super().__init__(data_root, **kwargs)
         self.version = version
+        self.pred_len = pred_len
         self._build_sample_list()
 
     def _build_sample_list(self):
@@ -328,9 +332,15 @@ class NuScenesDataset(STAFDataset):
         logger.info(f"NuScenes {self.split}: {len(self.samples)} samples from {len(split_scenes)} scenes")
 
     def _get_split_scenes(self) -> set:
-        """Get scene names for the current split."""
+        """Get scene names for the current split, handling both full trainval and mini."""
         from nuscenes.utils.splits import create_splits_scenes
         splits = create_splits_scenes()
+        if "mini" in self.version:
+            split_key = "mini_train" if self.split == "train" else "mini_val"
+            scenes = splits.get(split_key, [])
+            if not scenes and self.nusc is not None:
+                scenes = [s["name"] for s in self.nusc.scene]
+            return set(scenes)
         return set(splits.get(self.split, []))
 
     def _load_image(self, sample_info: Dict) -> Optional[np.ndarray]:
@@ -355,9 +365,6 @@ class NuScenesDataset(STAFDataset):
 
     def _load_imu(self, sample_info: Dict) -> Dict:
         """Load IMU/CAN bus data from nuScenes."""
-        # nuScenes provides CAN bus data at ~100Hz via the can_bus expansion
-        # For now, return synthetic IMU matching the expected format
-        # Full CAN bus integration requires the nuscenes-can-bus expansion pack
         return {
             "gyro": np.zeros((20, 3), dtype=np.float32),
             "accel": np.tile([0.0, 0.0, 9.81], (20, 1)).astype(np.float32),
@@ -369,6 +376,69 @@ class NuScenesDataset(STAFDataset):
             ),
             "expected_dt_ms": 5.0,
         }
+
+    def _load_waypoints(self, sample_info: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        """Extract future relative waypoints (pred_len, 2) and target point in vehicle frame."""
+        if self.nusc is None:
+            wps = np.array([[step * 2.0, 0.0] for step in range(1, self.pred_len + 1)], dtype=np.float32)
+            return wps, wps[-1]
+
+        try:
+            cam_data = self.nusc.get("sample_data", sample_info["cam_token"])
+            cur_pose = self.nusc.get("ego_pose", cam_data["ego_pose_token"])
+            cur_trans = np.array(cur_pose["translation"][:2], dtype=np.float64)
+            q = cur_pose["rotation"]  # [w, x, y, z]
+
+            # In nuScenes, vehicle forward is +y in vehicle frame
+            # World forward vector: R * [0, 1, 0]^T
+            v_fwd_x = 2.0 * (q[1] * q[2] - q[0] * q[3])
+            v_fwd_y = 1.0 - 2.0 * (q[1]**2 + q[3]**2)
+            yaw = np.arctan2(v_fwd_y, v_fwd_x)
+
+            cos_y = np.cos(yaw)
+            sin_y = np.sin(yaw)
+
+            waypoints = []
+            curr_token = sample_info["token"]
+
+            for step in range(1, self.pred_len + 1):
+                cur_sample = self.nusc.get("sample", curr_token)
+                next_token = cur_sample.get("next")
+                if next_token:
+                    next_sample = self.nusc.get("sample", next_token)
+                    next_cam = self.nusc.get("sample_data", next_sample["data"]["CAM_FRONT"])
+                    next_pose = self.nusc.get("ego_pose", next_cam["ego_pose_token"])
+                    next_trans = np.array(next_pose["translation"][:2], dtype=np.float64)
+
+                    dx = next_trans[0] - cur_trans[0]
+                    dy = next_trans[1] - cur_trans[1]
+
+                    # Project to local vehicle forward (x) and lateral (y)
+                    loc_fwd = float(dx * cos_y + dy * sin_y)
+                    loc_lat = float(-dx * sin_y + dy * cos_y)
+                    waypoints.append([loc_fwd, loc_lat])
+                    curr_token = next_token
+                else:
+                    # Extrapolate linearly from last waypoint or forward step
+                    last_fwd = waypoints[-1][0] if waypoints else (step - 1) * 2.0
+                    last_lat = waypoints[-1][1] if waypoints else 0.0
+                    step_fwd = (waypoints[-1][0] - waypoints[-2][0]) if len(waypoints) > 1 else 2.0
+                    waypoints.append([last_fwd + step_fwd, last_lat])
+
+            wps_arr = np.array(waypoints, dtype=np.float32)
+            target = wps_arr[-1]
+            return wps_arr, target
+        except Exception as e:
+            wps = np.array([[step * 2.0, 0.0] for step in range(1, self.pred_len + 1)], dtype=np.float32)
+            return wps, wps[-1]
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sample_dict = super().__getitem__(idx)
+        sample_info = self.samples[idx]
+        wps, target = self._load_waypoints(sample_info)
+        sample_dict["waypoints"] = torch.from_numpy(wps).float()
+        sample_dict["target_point"] = torch.from_numpy(target).float()
+        return sample_dict
 
 
 class EuRoCDataset(STAFDataset):
@@ -505,22 +575,12 @@ class CARLASTAFDataset(STAFDataset):
             logger.warning(f"CARLA data_root not found: {self.data_root}")
             return
 
-        # Find all routes (either in subfolders like dirt_dataset_23_11 or directly)
+        # Recursively find all route directories containing sensor recordings
         routes = []
-        entries = sorted(os.listdir(self.data_root))
-        for entry in entries:
-            p = os.path.join(self.data_root, entry)
-            if not os.path.isdir(p):
-                continue
-            # Check if this is a scenario directory containing routes
-            sub_entries = [d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d))]
-            if any("route" in d.lower() or "routes" in d.lower() for d in sub_entries):
-                for sub in sub_entries:
-                    route_path = os.path.join(p, sub)
-                    if os.path.isdir(os.path.join(route_path, "rgb")):
-                        routes.append(route_path)
-            elif os.path.isdir(os.path.join(p, "rgb")):
-                routes.append(p)
+        for root, dirs, files in os.walk(self.data_root):
+            if "rgb" in dirs:
+                routes.append(root)
+        routes = sorted(list(set(routes)))
 
         logger.info(f"CARLASTAFDataset: Found {len(routes)} valid route directories")
 

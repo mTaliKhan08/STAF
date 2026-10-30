@@ -47,23 +47,32 @@ checkpoint_volume = modal.Volume.from_name("staf-checkpoints", create_if_missing
 
 # Locate STAF repo root and Baseline repos
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.exists(os.path.join(SCRIPT_DIR, "../staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-elif os.path.exists(os.path.join(SCRIPT_DIR, "../../STAF/staf")):
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF"))
+if os.path.exists("/root/STAF"):
+    staf_local_path = "/root/STAF"
+    tf_code_path = "/root/Baseline/TransFuser/team_code_transfuser" if os.path.exists("/root/Baseline/TransFuser/team_code_transfuser") else None
 else:
-    staf_local_path = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+    staf_candidates = [
+        os.path.abspath(os.path.join(SCRIPT_DIR, "../../../STAF")),
+        os.path.abspath(os.path.join(SCRIPT_DIR, "../../STAF")),
+        os.path.abspath(os.path.join(SCRIPT_DIR, "../staf")),
+        os.path.abspath(os.path.join(SCRIPT_DIR, "..")),
+    ]
+    staf_local_path = None
+    for c in staf_candidates:
+        if os.path.exists(os.path.join(c, "staf", "models")):
+            staf_local_path = c
+            break
+    assert staf_local_path is not None, f"Could not locate STAF root from {SCRIPT_DIR}"
 
-# Locate team_code_transfuser directory (ONLY the Python source code, NEVER .envs or CARLA binaries)
-tf_code_candidates = [
-    os.path.abspath(os.path.join(SCRIPT_DIR, "../team_code_transfuser")),
-    os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser/team_code_transfuser")),
-]
-tf_code_path = None
-for p in tf_code_candidates:
-    if os.path.exists(p) and os.path.exists(os.path.join(p, "train.py")):
-        tf_code_path = p
-        break
+    tf_code_candidates = [
+        os.path.abspath(os.path.join(SCRIPT_DIR, "../team_code_transfuser")),
+        os.path.abspath(os.path.join(SCRIPT_DIR, "../../Baseline/transfuser/team_code_transfuser")),
+    ]
+    tf_code_path = None
+    for p in tf_code_candidates:
+        if os.path.exists(p) and os.path.exists(os.path.join(p, "train.py")):
+            tf_code_path = p
+            break
 
 # GPU-ready container image with all dependencies and lightweight local repos mounted (Modal v1.0+ API)
 training_image = (
@@ -85,14 +94,16 @@ training_image = (
         "scikit-image",
         "tqdm",
     )
-    .add_local_dir(
+)
+
+if not os.path.exists("/root/STAF") and staf_local_path:
+    training_image = training_image.add_local_dir(
         staf_local_path,
         remote_path="/root/STAF",
         ignore=["**/__pycache__", "**/.git", "**/checkpoints", "**/*.pth", "**/*.pt", "**/runs", "**/weights"],
     )
-)
 
-if tf_code_path:
+if not os.path.exists("/root/Baseline/TransFuser/team_code_transfuser") and tf_code_path:
     training_image = training_image.add_local_dir(
         tf_code_path,
         remote_path="/root/Baseline/TransFuser/team_code_transfuser",
@@ -110,7 +121,7 @@ if tf_code_path:
     timeout=86400,  # 24 hours max
     volumes={
         "/data": data_volume,
-        "/data/nuscenes": nuscenes_volume,
+        "/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,  # 32GB RAM
@@ -197,12 +208,21 @@ def train_staf(
         ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_epoch_*.pth")))
         if ckpts:
             latest = ckpts[-1]
-            ckpt = torch.load(latest, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            start_epoch = ckpt["epoch"] + 1
-            best_val_loss = ckpt.get("metrics", {}).get("val_loss", float("inf"))
-            logger.info(f"Resumed from {latest} (epoch {start_epoch})")
+            try:
+                ckpt = torch.load(latest, map_location=device, weights_only=False)
+                incompatible = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+                if incompatible.missing_keys:
+                    logger.info(f"Loaded checkpoint with missing keys: {incompatible.missing_keys}")
+                if "optimizer_state_dict" in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    except Exception:
+                        logger.warning("Optimizer state not matched, continuing with fresh optimizer")
+                start_epoch = ckpt.get("epoch", 0) + 1
+                best_val_loss = ckpt.get("metrics", {}).get("val_loss", float("inf"))
+                logger.info(f"Resumed from {latest} (epoch {start_epoch})")
+            except Exception as e:
+                logger.warning(f"Could not load {latest}: {e}. Starting fresh.")
 
     # Build dataset
     if smoke_test:
@@ -212,26 +232,34 @@ def train_staf(
 
         np.random.seed(42)
         n = 64
+        train_labels = torch.randint(0, num_classes, (n,)) if num_classes > 0 else torch.zeros(n, dtype=torch.long)
+        val_labels = torch.randint(0, num_classes, (n // 2,)) if num_classes > 0 else torch.zeros(n // 2, dtype=torch.long)
         train_dataset = TensorDataset(
             torch.rand(n, 3, 256, 256),
             torch.rand(n, 2, 256, 256),
             torch.randn(n, 9) * 0.1,
-            torch.randint(0, num_classes, (n,)),
+            train_labels,
+            torch.randn(n, pred_len, 2),
+            torch.randn(n, 2),
         )
         val_dataset = TensorDataset(
             torch.rand(n // 2, 3, 256, 256),
             torch.rand(n // 2, 2, 256, 256),
             torch.randn(n // 2, 9) * 0.1,
-            torch.randint(0, num_classes, (n // 2,)),
+            val_labels,
+            torch.randn(n // 2, pred_len, 2),
+            torch.randn(n // 2, 2),
         )
 
         def collate_dict(batch):
-            imgs, lidars, kines, labels = zip(*batch)
+            imgs, lidars, kines, labels, wps, tgts = zip(*batch)
             return {
                 "image": torch.stack(imgs),
                 "lidar_bev": torch.stack(lidars),
                 "x_kinematic": torch.stack(kines),
                 "label": torch.stack(labels),
+                "waypoints": torch.stack(wps),
+                "target_point": torch.stack(tgts),
             }
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_dict)
@@ -241,9 +269,34 @@ def train_staf(
         from torch.utils.data import DataLoader
 
         logger.info("Loading CARLASTAFDataset (simulation routes with domain augmentations)...")
-        train_dataset = CARLASTAFDataset("/data/carla_transfuser", split="train", pred_len=pred_len, augment_domain=True)
-        val_dataset = CARLASTAFDataset("/data/carla_transfuser", split="val", pred_len=pred_len, augment_domain=False)
+        carla_root = "/data/carla_transfuser" if os.path.exists("/data/carla_transfuser") else "/data"
+        train_dataset = CARLASTAFDataset(carla_root, split="train", pred_len=pred_len, augment_domain=True)
+        val_dataset = CARLASTAFDataset(carla_root, split="val", pred_len=pred_len, augment_domain=False)
         logger.info(f"CARLA samples: {len(train_dataset)} train, {len(val_dataset)} val")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=4, pin_memory=True,
+        )
+    elif dataset_name == "all":
+        from staf.data.dataset import CARLASTAFDataset, NuScenesDataset
+        from torch.utils.data import DataLoader, ConcatDataset
+
+        logger.info("Loading JOINT MULTI-DOMAIN DATASET (CARLA Sim + nuScenes Real-World)...")
+        carla_root = "/data/carla_transfuser" if os.path.exists("/data/carla_transfuser") else "/data"
+        carla_train = CARLASTAFDataset(carla_root, split="train", pred_len=pred_len, augment_domain=True)
+        carla_val = CARLASTAFDataset(carla_root, split="val", pred_len=pred_len, augment_domain=False)
+
+        nusc_train = NuScenesDataset("/nuscenes", split="train", pred_len=pred_len, num_classes=num_classes)
+        nusc_val = NuScenesDataset("/nuscenes", split="val", pred_len=pred_len, num_classes=num_classes)
+
+        train_dataset = ConcatDataset([carla_train, nusc_train])
+        val_dataset = ConcatDataset([carla_val, nusc_val])
+        logger.info(f"Joint Dataset: {len(train_dataset)} train ({len(carla_train)} CARLA + {len(nusc_train)} nuScenes), {len(val_dataset)} val")
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
@@ -257,8 +310,10 @@ def train_staf(
         from staf.data.dataset import NuScenesDataset
         from torch.utils.data import DataLoader
 
-        train_dataset = NuScenesDataset("/data/nuscenes", split="train", num_classes=num_classes)
-        val_dataset = NuScenesDataset("/data/nuscenes", split="val", num_classes=num_classes)
+        logger.info("Loading NuScenesDataset (real-world urban driving with trajectory waypoints)...")
+        train_dataset = NuScenesDataset("/nuscenes", split="train", pred_len=pred_len, num_classes=num_classes)
+        val_dataset = NuScenesDataset("/nuscenes", split="val", pred_len=pred_len, num_classes=num_classes)
+        logger.info(f"nuScenes samples: {len(train_dataset)} train, {len(val_dataset)} val")
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
             num_workers=4, pin_memory=True, drop_last=True,
@@ -392,7 +447,7 @@ def train_staf(
     timeout=86400,
     volumes={
         "/data": data_volume,
-        "/data/nuscenes": nuscenes_volume,
+        "/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,
@@ -444,7 +499,7 @@ def train_transfuser(
     timeout=86400,
     volumes={
         "/data": data_volume,
-        "/data/nuscenes": nuscenes_volume,
+        "/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,
@@ -466,7 +521,7 @@ def train_diffuser(epochs: int = 12, batch_size: int = 4):
     from staf.baselines.diffuser_adapter import main as df_main
     sys.argv = [
         "diffuser_adapter",
-        "--data-root", "/data/nuscenes",
+        "--data-root", "/nuscenes",
         "--logdir", "/checkpoints/diffuser",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),

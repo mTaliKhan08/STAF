@@ -113,3 +113,4 @@ def main(mini: bool = True):
         conf_str = f.read()
 
     sync_nuscenes.remote(rclone_conf_str=conf_str, use_mini=mini)
+
