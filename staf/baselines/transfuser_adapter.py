@@ -151,6 +151,8 @@ class OptimizedTransFuserTrainer:
         self.config.n_layer = args.n_layer
         self.config.use_point_pillars = False
         self.config.backbone = args.backbone
+        if args.wp_only:
+            self.config.multitask = False
 
         # Build model
         logger.info(f"Building TransFuser model (backbone={args.backbone}, "
@@ -277,7 +279,7 @@ class OptimizedTransFuserTrainer:
         for batch_idx, data in enumerate(self.train_loader):
             batch = self._load_batch(data)
 
-            with autocast(device_type="cuda", enabled=self.use_amp):
+            with autocast(enabled=self.use_amp):
                 losses = self._forward(batch)
                 loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
                 for key, value in losses.items():
@@ -418,9 +420,13 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
     if args.no_amp:
         args.use_amp = False
     trainer = OptimizedTransFuserTrainer(args)
     trainer.run()
+
+
+if __name__ == "__main__":
+    main()

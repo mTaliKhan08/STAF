@@ -149,6 +149,25 @@ def test_focal_loss_class_balance():
     print(f"[PASS] Class balance: rare/common weight ratio = {ratio:.1f}x")
 
 
+
+def test_staf_model_waypoint_prediction():
+    """Verify STAFModel waypoint prediction head for simulation driving."""
+    from staf.models.staf_model import STAFModel
+    
+    B = 2
+    model = STAFModel(embed_dim=128, pred_len=4, use_target_point=True, pretrained_backbones=False)
+    rgb = torch.randn(B, 3, 256, 256)
+    lidar = torch.randn(B, 2, 256, 256)
+    imu = torch.randn(B, 9)
+    target = torch.randn(B, 2)
+    
+    out = model(rgb, lidar, imu, target_point=target)
+    assert "waypoints" in out, "Model output missing waypoints!"
+    assert out["waypoints"].shape == (B, 4, 2), f"Expected (B, 4, 2), got {out['waypoints'].shape}"
+    assert "w_cam" in out and "w_lidar" in out, "Missing gating weights!"
+    print(f"[PASS] STAFModel waypoint prediction: shape={out['waypoints'].shape}")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("STAF Core Module Unit Tests")

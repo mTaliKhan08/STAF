@@ -24,6 +24,14 @@ Usage:
 
 import os
 import sys
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import modal
 
 app = modal.App("staf-data-pipeline")
@@ -155,29 +163,64 @@ def sync_with_rclone(rclone_conf_str: str, datasets: list):
     cpu=4.0,
     memory=16384,
 )
-def download_with_gdown(gdrive_id: str, dataset_name: str, is_folder: bool = True):
+def download_with_gdown(gdrive_id: str, dataset_name: str = "Thesis_Datasets", is_folder: bool = True):
     """
-    Download a dataset archive using Google Drive ID via gdown.
+    Download dataset archives from Google Drive using gdown and extract them onto the persistent volume.
     """
     import subprocess
-    dest_dir = f"/data/{dataset_name}"
-    os.makedirs(dest_dir, exist_ok=True)
+    import os
 
-    print(f">> Downloading {dataset_name} using gdown from ID: {gdrive_id}...")
+    print(f">> Starting Google Drive ingestion from ID: {gdrive_id}...")
+
+    # Download to /data
     if is_folder:
-        cmd = f"gdown --folder https://drive.google.com/drive/folders/{gdrive_id} -O {dest_dir}"
+        cmd = f"gdown --folder https://drive.google.com/drive/folders/{gdrive_id} -O /data --continue"
     else:
-        cmd = f"gdown https://drive.google.com/uc?id={gdrive_id} -O {dest_dir}/archive.zip"
+        dest_file = f"/data/{dataset_name}.zip"
+        cmd = f"gdown https://drive.google.com/uc?id={gdrive_id} -O {dest_file}"
 
-    subprocess.run(cmd, shell=True, check=True)
+    print(f"Executing: {cmd}")
+    res = subprocess.run(cmd, shell=True)
+    if res.returncode != 0:
+        print(f"[WARN] gdown exited with code {res.returncode}, continuing to scan and extraction...")
 
-    # If it was a zip/tar file, extract it
-    if not is_folder:
-        print(f">> Extracting archive inside {dest_dir}...")
-        subprocess.run(f"unzip -q -o {dest_dir}/archive.zip -d {dest_dir}", shell=True)
+    # Look for any downloaded zip or tar files in /data and subdirectories
+    print("\n>> Scanning for downloaded archives to unpack...")
+    subprocess.run("find /data -maxdepth 4 -type f \\( -name '*.zip' -o -name '*.tar*' -o -name '*.tgz' \\) -exec ls -lh {} \\;", shell=True)
 
+    # 1. Unpack any .zip archives in-place
+    print("\n>> Unpacking .zip files...")
+    subprocess.run(
+        "find /data -name '*.zip' | while read -r zipfile; do "
+        "  dir=$(dirname \"$zipfile\"); "
+        "  echo \"Unzipping $zipfile into $dir...\"; "
+        "  unzip -q -o \"$zipfile\" -d \"$dir\"; "
+        "done",
+        shell=True
+    )
+
+    # 2. Unpack any .tar / .tgz archives in-place
+    print("\n>> Unpacking .tar / .tgz files...")
+    subprocess.run(
+        "find /data -name '*.tar*' -o -name '*.tgz' | while read -r tarfile; do "
+        "  dir=$(dirname \"$tarfile\"); "
+        "  echo \"Extracting $tarfile into $dir...\"; "
+        "  tar xf \"$tarfile\" -C \"$dir\"; "
+        "done",
+        shell=True
+    )
+
+    # Commit persistent changes to the Modal volume
+    print("\n>> Committing changes to Modal persistent volume...")
     data_volume.commit()
-    print(f">> Successfully downloaded & committed {dataset_name} to volume!")
+    print(">> Data volume committed successfully!")
+
+    # Print final directory structure
+    print("\n============================================================")
+    print(">> FINAL PERSISTENT VOLUME CONTENTS:")
+    print("============================================================")
+    subprocess.run(["df", "-h", "/data"])
+    subprocess.run("ls -la /data", shell=True)
 
 @app.local_entrypoint()
 def main(

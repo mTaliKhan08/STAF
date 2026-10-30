@@ -203,6 +203,82 @@ def test_class_frequency_computation():
     print(f"[PASS] Class frequencies: {counts}")
 
 
+
+def test_carla_staf_dataset_synthetic(tmp_path=None):
+    """Verify CARLASTAFDataset loads and formats synchronized multi-modal data and waypoints."""
+    import tempfile
+    import json
+    from PIL import Image
+    from staf.data.dataset import CARLASTAFDataset
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        route_dir = os.path.join(tmp_dir, "scenario1", "routes_Town01_00")
+        os.makedirs(os.path.join(route_dir, "rgb"))
+        os.makedirs(os.path.join(route_dir, "lidar"))
+        os.makedirs(os.path.join(route_dir, "measurements"))
+        os.makedirs(os.path.join(route_dir, "label_raw"))
+        
+        # Create 12 synthetic frames
+        for i in range(12):
+            fid = f"{i:04d}"
+            # RGB
+            img = Image.fromarray(np.random.randint(50, 200, (120, 160, 3), dtype=np.uint8))
+            img.save(os.path.join(route_dir, "rgb", f"{fid}.png"))
+            # LiDAR (XYZI points)
+            pts = np.random.randn(200, 4).astype(np.float32)
+            np.save(os.path.join(route_dir, "lidar", f"{fid}.npy"), pts)
+            # Measurements (IMU & speed)
+            with open(os.path.join(route_dir, "measurements", f"{fid}.json"), "w") as f:
+                json.dump({"speed": 5.0, "accelerometer": [0.1, 0.0, 0.0], "gyroscope": [0.0, 0.0, 0.05]}, f)
+            # Labels (Waypoints)
+            with open(os.path.join(route_dir, "label_raw", f"{fid}.json"), "w") as f:
+                json.dump({"x": float(i * 2.0), "y": 0.0, "theta": 0.0}, f)
+                
+        ds = CARLASTAFDataset(tmp_dir, split="train", pred_len=4)
+        assert len(ds) > 0, "Dataset should have discovered synthetic route samples"
+        sample = ds[0]
+        
+        assert "image" in sample, "Sample missing image tensor"
+        assert "lidar_bev" in sample, "Sample missing lidar_bev tensor"
+        assert "x_kinematic" in sample, "Sample missing x_kinematic tensor"
+        assert "waypoints" in sample, "Sample missing waypoints"
+        assert sample["waypoints"].shape == (4, 2), f"Expected (4, 2), got {sample['waypoints'].shape}"
+        assert sample["x_kinematic"].shape == (9,), f"Expected (9,), got {sample['x_kinematic'].shape}"
+        print(f"[PASS] CARLASTAFDataset synthetic: len={len(ds)}, waypoints shape={sample['waypoints'].shape}")
+
+
+
+def test_staf_agent_simulation_step():
+    """Verify STAFAgent runs in CARLA simulation environment and produces valid VehicleControl."""
+    from staf.agents.staf_agent import STAFAgent
+    
+    agent = STAFAgent()
+    agent.setup(path_to_conf_file=None)
+    
+    sensors = agent.sensors()
+    assert len(sensors) >= 4, f"Expected at least 4 sensors, got {len(sensors)}"
+    
+    # Mock sensor tick matching CARLA simulation format
+    mock_input = {
+        "rgb": (1, np.random.randint(0, 255, (480, 960, 3), dtype=np.uint8)),
+        "lidar": (1, np.random.randn(500, 4).astype(np.float32)),
+        "imu": (1, np.array([0.05, 0.0, 9.81, 0.0, 0.0, 0.02], dtype=np.float32)),
+        "speed": (1, {"speed": 5.2}),
+    }
+    
+    control = agent.run_step(mock_input, timestamp=1.0)
+    assert hasattr(control, "steer"), "Control output missing steer"
+    assert hasattr(control, "throttle"), "Control output missing throttle"
+    assert hasattr(control, "brake"), "Control output missing brake"
+    assert -1.0 <= control.steer <= 1.0, f"Steer out of bounds: {control.steer}"
+    assert 0.0 <= control.throttle <= 1.0, f"Throttle out of bounds: {control.throttle}"
+    assert 0.0 <= control.brake <= 1.0, f"Brake out of bounds: {control.brake}"
+    assert len(agent.gating_log) > 0, "Agent failed to record gating weights telemetry"
+    
+    agent.destroy()
+    print(f"[PASS] STAFAgent closed-loop control step: steer={control.steer:.3f}, throttle={control.throttle:.3f}, brake={control.brake:.3f}")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("STAF Phase 1 Data Pipeline Tests")

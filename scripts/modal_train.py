@@ -42,6 +42,7 @@ app = modal.App("staf-thesis-training")
 
 # Persistent volumes for datasets and checkpoints
 data_volume = modal.Volume.from_name("staf-datasets", create_if_missing=True)
+nuscenes_volume = modal.Volume.from_name("staf-nuscenes", create_if_missing=True)
 checkpoint_volume = modal.Volume.from_name("staf-checkpoints", create_if_missing=True)
 
 # Locate STAF repo root and Baseline repos
@@ -80,6 +81,9 @@ training_image = (
         "timm",
         "einops",
         "nuscenes-devkit",
+        "ujson",
+        "scikit-image",
+        "tqdm",
     )
     .add_local_dir(
         staf_local_path,
@@ -106,15 +110,18 @@ if tf_code_path:
     timeout=86400,  # 24 hours max
     volumes={
         "/data": data_volume,
+        "/data/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,  # 32GB RAM
 )
 def train_staf(
+    dataset_name: str = "carla",
     epochs: int = 18,
     batch_size: int = 8,
     lr: float = 3e-4,
-    num_classes: int = 16,
+    num_classes: int = 0,
+    pred_len: int = 4,
     queue_length: int = 5,
     gamma: float = 2.0,
     resume: bool = True,
@@ -152,6 +159,8 @@ def train_staf(
         num_fusion_layers=4,
         queue_length=queue_length,
         num_classes=num_classes,
+        pred_len=pred_len,
+        use_target_point=True,
         pretrained_backbones=not smoke_test,
     ).to(device)
 
@@ -227,6 +236,23 @@ def train_staf(
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_dict)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_dict)
+    elif dataset_name == "carla":
+        from staf.data.dataset import CARLASTAFDataset
+        from torch.utils.data import DataLoader
+
+        logger.info("Loading CARLASTAFDataset (simulation routes with domain augmentations)...")
+        train_dataset = CARLASTAFDataset("/data/carla_transfuser", split="train", pred_len=pred_len, augment_domain=True)
+        val_dataset = CARLASTAFDataset("/data/carla_transfuser", split="val", pred_len=pred_len, augment_domain=False)
+        logger.info(f"CARLA samples: {len(train_dataset)} train, {len(val_dataset)} val")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=4, pin_memory=True,
+        )
     else:
         from staf.data.dataset import NuScenesDataset
         from torch.utils.data import DataLoader
@@ -270,16 +296,21 @@ def train_staf(
             rgb = batch["image"].to(device)
             lidar_bev = batch["lidar_bev"].to(device)
             x_kinematic = batch["x_kinematic"].to(device)
-            labels = batch["label"].to(device)
+            target = batch.get("target_point")
+            if target is not None:
+                target = target.to(device)
 
             optimizer.zero_grad()
             with amp_ctx:
-                outputs = model(rgb, lidar_bev, x_kinematic)
-                loss = (
-                    criterion(outputs["logits"], labels)
-                    if "logits" in outputs
-                    else outputs["fused_features"].mean() * 0.0
-                )
+                outputs = model(rgb, lidar_bev, x_kinematic, target_point=target)
+                loss = torch.tensor(0.0, device=device)
+                if "waypoints" in outputs and "waypoints" in batch:
+                    gt_wps = batch["waypoints"].to(device)
+                    loss = loss + torch.nn.functional.l1_loss(outputs["waypoints"], gt_wps)
+                if "logits" in outputs and "label" in batch:
+                    loss = loss + criterion(outputs["logits"], batch["label"].to(device))
+                if loss.item() == 0.0:
+                    loss = outputs["fused_features"].mean() * 0.0
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -308,12 +339,15 @@ def train_staf(
                 rgb = batch["image"].to(device)
                 lidar_bev = batch["lidar_bev"].to(device)
                 x_kinematic = batch["x_kinematic"].to(device)
-                labels = batch["label"].to(device)
-                outputs = model(rgb, lidar_bev, x_kinematic)
-                if "logits" in outputs:
-                    loss = criterion(outputs["logits"], labels)
-                else:
-                    loss = torch.tensor(0.0)
+                target = batch.get("target_point")
+                if target is not None:
+                    target = target.to(device)
+                outputs = model(rgb, lidar_bev, x_kinematic, target_point=target)
+                loss = torch.tensor(0.0, device=device)
+                if "waypoints" in outputs and "waypoints" in batch:
+                    loss = loss + torch.nn.functional.l1_loss(outputs["waypoints"], batch["waypoints"].to(device))
+                if "logits" in outputs and "label" in batch:
+                    loss = loss + criterion(outputs["logits"], batch["label"].to(device))
                 val_loss += loss.item() * rgb.size(0)
                 val_samples += rgb.size(0)
 
@@ -358,11 +392,18 @@ def train_staf(
     timeout=86400,
     volumes={
         "/data": data_volume,
+        "/data/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,
 )
-def train_transfuser(epochs: int = 20, batch_size: int = 6, accum_steps: int = 4):
+def train_transfuser(
+    epochs: int = 20,
+    batch_size: int = 6,
+    accum_steps: int = 4,
+    setting: str = "all",
+    wp_only: bool = True,
+):
     """Train TransFuser baseline on Modal GPU."""
     import sys
     sys.path.insert(0, "/root/STAF")
@@ -378,15 +419,19 @@ def train_transfuser(epochs: int = 20, batch_size: int = 6, accum_steps: int = 4
     os.environ["TRANSFUSER_ROOT"] = "/root/Baseline/TransFuser"
 
     from staf.baselines.transfuser_adapter import main as tf_main
-    sys.argv = [
+    cmd_args = [
         "transfuser_adapter",
         "--root-dir", "/data/carla_transfuser",
         "--logdir", "/checkpoints/transfuser",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--accum-steps", str(accum_steps),
+        "--setting", setting,
         "--use-amp",
     ]
+    if wp_only:
+        cmd_args.append("--wp-only")
+    sys.argv = cmd_args
     tf_main()
 
     checkpoint_volume.commit()
@@ -399,6 +444,7 @@ def train_transfuser(epochs: int = 20, batch_size: int = 6, accum_steps: int = 4
     timeout=86400,
     volumes={
         "/data": data_volume,
+        "/data/nuscenes": nuscenes_volume,
         "/checkpoints": checkpoint_volume,
     },
     memory=32768,
@@ -439,9 +485,12 @@ def train_diffuser(epochs: int = 12, batch_size: int = 4):
 @app.local_entrypoint()
 def main(
     job: str = "staf",
+    dataset: str = "carla",
     epochs: int = 18,
     batch_size: int = 8,
     lr: float = 3e-4,
+    setting: str = "all",
+    wp_only: bool = True,
     smoke_test: bool = False,
 ):
     """
@@ -452,19 +501,27 @@ def main(
         epochs: Number of training epochs
         batch_size: Batch size
         lr: Learning rate
+        setting: Setting for TransFuser ('all' or '02_05_withheld')
+        wp_only: Train waypoint navigation only (recommended for streamlined CARLA)
         smoke_test: If True, use synthetic data for quick validation
     """
     print(f"Launching {job} training on Modal (epochs={epochs}, bs={batch_size})")
 
     if job == "staf":
         result = train_staf.remote(
+            dataset_name=dataset,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
             smoke_test=smoke_test,
         )
     elif job == "transfuser":
-        result = train_transfuser.remote(epochs=epochs, batch_size=batch_size)
+        result = train_transfuser.remote(
+            epochs=epochs,
+            batch_size=batch_size,
+            setting=setting,
+            wp_only=wp_only,
+        )
     elif job == "diffuser":
         result = train_diffuser.remote(epochs=epochs, batch_size=batch_size)
     else:

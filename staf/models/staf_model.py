@@ -167,6 +167,8 @@ class STAFModel(nn.Module):
         lidar_in_channels: int = 2,
         dropout: float = 0.1,
         num_classes: int = 0,
+        pred_len: int = 4,
+        use_target_point: bool = True,
         pretrained_backbones: bool = True,
     ):
         super().__init__()
@@ -223,11 +225,28 @@ class STAFModel(nn.Module):
         else:
             self.classifier = None
 
+        # === Waypoint Trajectory Prediction Head (CARLA / Autonomous Driving) ===
+        self.pred_len = pred_len
+        self.use_target_point = use_target_point
+        if pred_len > 0:
+            in_dim = embed_dim + (2 if use_target_point else 0)
+            self.waypoint_head = nn.Sequential(
+                nn.Linear(in_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=dropout),
+                nn.Linear(128, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, pred_len * 2),
+            )
+        else:
+            self.waypoint_head = None
+
     def forward(
         self,
         rgb: torch.Tensor,
         lidar_bev: torch.Tensor,
         x_kinematic: torch.Tensor,
+        target_point: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full STAF forward pass.
@@ -276,6 +295,20 @@ class STAFModel(nn.Module):
 
         if self.classifier is not None:
             output['logits'] = self.classifier(temporally_smoothed)
+
+        if self.waypoint_head is not None:
+            if self.use_target_point and target_point is not None:
+                wp_input = torch.cat([temporally_smoothed, target_point], dim=-1)
+            elif self.use_target_point:
+                dummy_target = torch.zeros(
+                    (temporally_smoothed.size(0), 2),
+                    device=temporally_smoothed.device,
+                    dtype=temporally_smoothed.dtype,
+                )
+                wp_input = torch.cat([temporally_smoothed, dummy_target], dim=-1)
+            else:
+                wp_input = temporally_smoothed
+            output['waypoints'] = self.waypoint_head(wp_input).view(-1, self.pred_len, 2)
 
         return output
 
