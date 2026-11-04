@@ -1,0 +1,4 @@
+slice,n_frames,definition,no_vision_ade,camera_only_ade,lidar_only_ade,full_fusion_ade
+Red Light,56,"light_hazard == True (100% stopped, v < 0.1 m/s)",0.0282,0.0896,0.0655,0.2028
+Dynamic Speed-Change,3088,abs(accel) > 1.0 m/s^2 (causal backward difference),0.8011,0.8571,0.8516,0.8313
+Junction,174,junction == True (OpenDRIVE unchannelized intersection),1.0628,1.994,1.9977,1.9346

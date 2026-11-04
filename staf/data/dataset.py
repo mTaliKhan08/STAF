@@ -18,6 +18,8 @@ Each sample returns:
 """
 
 import os
+import re
+import random
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -147,6 +149,7 @@ class STAFDataset(Dataset):
             "image": image_tensor,
             "lidar_bev": bev_tensor,
             "x_kinematic": x_kinematic,
+            "speed": torch.tensor([0.0], dtype=torch.float32),
             "label": label_tensor,
             "metadata": {
                 "idx": idx,
@@ -212,10 +215,9 @@ class STAFDataset(Dataset):
         px = np.clip(px, 0, W - 1)
         py = np.clip(py, 0, H - 1)
 
-        # Channel 0: max height
-        for i in range(len(x)):
-            bev[0, py[i], px[i]] = max(bev[0, py[i], px[i]], z[i])
-            bev[1, py[i], px[i]] += 1.0  # density
+        # Vectorized projection to BEV
+        np.maximum.at(bev[0], (py, px), z)
+        np.add.at(bev[1], (py, px), 1.0)
 
         # Normalize density channel
         max_density = bev[1].max()
@@ -546,6 +548,70 @@ class EuRoCDataset(STAFDataset):
 
 
 
+def transform_future_ego_pose(cur_matrix: np.ndarray, future_matrix: np.ndarray) -> np.ndarray:
+    """
+    Transform future ego pose from world coordinates into current ego vehicle coordinate frame
+    using SE(3) rigid body matrix inverse: T_rel = inv(T_cur) @ T_future.
+
+    Matrix Convention:
+        In CARLA / TransFuser recordings, ego_matrix is a 4x4 SE(3) transformation matrix
+        constructed from Unreal Engine coordinates where translation column is [y, -x, z]^T.
+        The relative transformation in the vehicle's body frame is:
+            T_rel = inv(T_cur) @ T_future
+
+    Output Coordinate Convention (Standard Robotics Frame ISO 8855 / SAE):
+        - Index 0 (+x): Forward displacement [meters]. In body frame, this is T_rel[0, 3].
+        - Index 1 (+y): Left lateral displacement [meters]. In CARLA body frame, axis 1 (+y) points Right,
+          so Left displacement is -T_rel[1, 3].
+
+    Args:
+        cur_matrix: 4x4 numpy array or nested list of current vehicle ego_matrix.
+        future_matrix: 4x4 numpy array or nested list of future vehicle ego_matrix.
+
+    Returns:
+        np.ndarray of shape (2,) containing [fwd, left] displacements in meters.
+    """
+    M_cur = np.array(cur_matrix, dtype=np.float64)
+    M_fut = np.array(future_matrix, dtype=np.float64)
+    M_rel = np.linalg.inv(M_cur) @ M_fut
+
+    fwd = float(M_rel[0, 3])
+    left = float(-M_rel[1, 3])
+    return np.array([fwd, left], dtype=np.float32)
+
+
+def wrap_angle(theta_diff: float) -> float:
+    """
+    Wrap angle difference into [-pi, pi] interval.
+    Handles transitions across 0 and 2pi (e.g. 359 deg -> 1 deg = +2 deg,
+    and 1 deg -> 359 deg = -2 deg).
+    """
+    import numpy as np
+    return float((theta_diff + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def transform_world_point_to_ego(cur_matrix: np.ndarray, world_point_xy: Tuple[float, float]) -> np.ndarray:
+    """
+    Transform world point (x, y) into current ego vehicle body frame.
+
+    In TransFuser / CARLA recordings, ego_matrix translation column is [y, -x, z]^T.
+    A world coordinate (x, y, 0) is mapped to [y, -x, 0, 1]^T in matrix space:
+        P_ego = inv(T_cur) @ [y_world, -x_world, 0, 1]^T
+
+    Output Coordinate Convention:
+        - Index 0: Forward distance [meters] = P_ego[0]
+        - Index 1: Left lateral distance [meters] = -P_ego[1]
+    """
+    M_cur = np.array(cur_matrix, dtype=np.float64)
+    M_cur_inv = np.linalg.inv(M_cur)
+    xw, yw = world_point_xy
+    P_mat = np.array([yw, -xw, 0.0, 1.0], dtype=np.float64)
+    P_ego = M_cur_inv @ P_mat
+    fwd = float(P_ego[0])
+    left = float(-P_ego[1])
+    return np.array([fwd, left], dtype=np.float32)
+
+
 class CARLASTAFDataset(STAFDataset):
     """
     CARLA Autonomous Driving Dataset adapter for STAF.
@@ -566,6 +632,10 @@ class CARLASTAFDataset(STAFDataset):
         super().__init__(data_root, split=split, **kwargs)
         self.pred_len = pred_len
         self.augment_domain = augment_domain and (split == "train")
+        # Per Phase 0.5b findings: Simulated data has no hardware dropouts.
+        # Data cleaner was discarding 18.7% of valid frames due to vehicle hood and dark scenes,
+        # inducing severe route/town bias. Disable cleaner for CARLA simulation data.
+        self.apply_cleaning = False
         self._build_sample_list()
 
     def _build_sample_list(self):
@@ -584,11 +654,41 @@ class CARLASTAFDataset(STAFDataset):
 
         logger.info(f"CARLASTAFDataset: Found {len(routes)} valid route directories")
 
-        # Split into train / val
-        if self.split == "val" and len(routes) > 1:
-            routes = routes[:max(1, len(routes) // 5)]
-        elif self.split == "train" and len(routes) > 1:
-            routes = routes[max(1, len(routes) // 5):]
+        # Town-based split:
+        # Held-out Test Towns: Town02, Town05 (strictly for final benchmark evaluation)
+        # Training Towns: All other towns (Town01, Town03, Town04, Town06, Town07, Town10HD)
+        test_routes = []
+        train_town_routes = []
+
+        for r in routes:
+            m = re.search(r"Town\d+(?:HD)?", r)
+            town = m.group(0) if m else "Unknown"
+            if town.startswith("Town02") or town.startswith("Town05"):
+                test_routes.append(r)
+            else:
+                train_town_routes.append(r)
+
+        # Deterministic 80/20 route split within training towns
+        import random
+        rng = random.Random(42)
+        train_town_routes_shuffled = list(train_town_routes)
+        rng.shuffle(train_town_routes_shuffled)
+        if len(train_town_routes_shuffled) > 1:
+            n_val = max(1, len(train_town_routes_shuffled) // 5)
+            val_routes = sorted(train_town_routes_shuffled[:n_val])
+            train_routes = sorted(train_town_routes_shuffled[n_val:])
+        else:
+            val_routes = list(train_town_routes_shuffled)
+            train_routes = list(train_town_routes_shuffled)
+
+        if self.split == "test":
+            routes = sorted(test_routes)
+        elif self.split == "val":
+            routes = val_routes
+        elif self.split == "train":
+            routes = train_routes
+        else:
+            raise ValueError(f"Unknown split: {self.split}")
 
         for route_dir in routes:
             rgb_dir = os.path.join(route_dir, "rgb")
@@ -600,8 +700,29 @@ class CARLASTAFDataset(STAFDataset):
             num_frames = len(frames)
 
             # Keep valid sequence indices allowing future prediction
-            for i in range(2, num_frames - self.pred_len - 2):
+            # In CARLA dataset (2 Hz logging), consecutive frames are spaced by 0.5s.
+            # max_future_stride = self.pred_len (pred_len=4 -> frames i+1, i+2, i+3, i+4 for 0.5-2.0s)
+            max_future_stride = self.pred_len
+            total_candidates = 0
+            fallback_exclusions = 0
+
+            for i in range(2, num_frames - max_future_stride - 1):
+                total_candidates += 1
                 f_id = frames[i]
+                m_path = os.path.join(meas_dir, f"{f_id}.json")
+                if not os.path.exists(m_path):
+                    fallback_exclusions += 1
+                    continue
+
+                has_all_future = True
+                for st in range(1, self.pred_len + 1):
+                    if not os.path.exists(os.path.join(meas_dir, f"{frames[i + st]}.json")):
+                        has_all_future = False
+                        break
+                if not has_all_future:
+                    fallback_exclusions += 1
+                    continue
+
                 self.samples.append({
                     "route_dir": route_dir,
                     "frame_id": f_id,
@@ -609,9 +730,15 @@ class CARLASTAFDataset(STAFDataset):
                     "frames_list": frames,
                     "rgb_path": os.path.join(rgb_dir, f"{f_id}.png"),
                     "lidar_path": os.path.join(lidar_dir, f"{f_id}.npy"),
-                    "meas_path": os.path.join(meas_dir, f"{f_id}.json"),
+                    "meas_path": m_path,
                     "label_dir": label_dir,
                 })
+
+            if total_candidates > 0:
+                fallback_frac = fallback_exclusions / total_candidates
+                assert fallback_frac < 0.001, (
+                    f"Waypoint fallback fraction {fallback_frac:.4%} exceeds hard threshold 0.1%!"
+                )
 
         logger.info(f"CARLASTAFDataset [{self.split}]: Loaded {len(self.samples)} frame samples")
 
@@ -656,7 +783,10 @@ class CARLASTAFDataset(STAFDataset):
             return np.zeros((100, 4), dtype=np.float32)
 
     def _load_imu(self, sample_info: Dict) -> Dict:
-        """Parse IMU acceleration, gyroscope, and velocity from CARLA measurements."""
+        """
+        Parse IMU acceleration, gyroscope, and velocity from CARLA measurements.
+        Strictly enforces expert action leak prevention: forbidding target_speed, steer, throttle, brake, angle.
+        """
         meas_path = sample_info["meas_path"]
         gyro = np.zeros((20, 3), dtype=np.float32)
         accel = np.tile([0.0, 0.0, 9.81], (20, 1)).astype(np.float32)
@@ -667,6 +797,10 @@ class CARLASTAFDataset(STAFDataset):
                 with open(meas_path, "r") as f:
                     data = json.load(f)
                 spd = float(data.get("speed", 0.0))
+                # Explicit check: Never leak expert planning actions into inputs
+                for forbidden_key in ["target_speed", "steer", "throttle", "brake", "angle"]:
+                    assert forbidden_key not in gyro, f"Leak: {forbidden_key} forbidden in kinematics"
+
                 # If accelerometer / gyroscope available in CARLA
                 if "accelerometer" in data:
                     a = data["accelerometer"]
@@ -690,57 +824,153 @@ class CARLASTAFDataset(STAFDataset):
             "expected_dt_ms": 5.0,
         }
 
-    def _load_waypoints(self, sample_info: Dict) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract future relative waypoints (pred_len, 2) and target navigation point."""
+    def _load_waypoints(self, sample_info: Dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        """
+        Extract future relative waypoints (pred_len, 2) and target navigation point
+        from measurements.json using SE(3) matrix transformation T_rel = inv(T_cur) @ T_future.
+        Output coordinates: forward = index 0 (+x), left = index 1 (+y).
+        """
         import json
-        label_dir = sample_info["label_dir"]
+        import math
+        meas_path = sample_info["meas_path"]
+        meas_dir = os.path.dirname(meas_path)
         frames = sample_info["frames_list"]
         idx = sample_info["frame_idx"]
 
-        # Current ego pose
-        cur_file = os.path.join(label_dir, f"{frames[idx]}.json")
-        cur_x, cur_y, cur_yaw = 0.0, 0.0, 0.0
-        if os.path.exists(cur_file):
-            try:
-                with open(cur_file, "r") as f:
-                    d = json.load(f)
-                cur_x = float(d.get("x", 0.0))
-                cur_y = float(d.get("y", 0.0))
-                cur_yaw = float(d.get("theta", 0.0))
-            except Exception:
-                pass
+        # In CARLA dataset (2 Hz logging), step strides: 1 frame = 0.5s, 2 = 1.0s, 3 = 1.5s, 4 = 2.0s
+        strides = [s + 1 for s in range(self.pred_len)]
+
+        if not os.path.exists(meas_path):
+            return None, None, 0.0
+
+        try:
+            with open(meas_path, "r") as f:
+                cur_data = json.load(f)
+            if "ego_matrix" in cur_data:
+                cur_M = cur_data["ego_matrix"]
+                cur_x = float(cur_data.get("x", 0.0))
+                cur_y = float(cur_data.get("y", 0.0))
+            else:
+                # Synthetic mock fallback
+                cur_x = float(cur_data.get("x", 0.0))
+                cur_y = float(cur_data.get("y", 0.0))
+                th = float(cur_data.get("theta", 0.0))
+                # Check label_raw if mock stored pose there
+                label_p = os.path.join(sample_info["label_dir"], f"{frames[idx]}.json")
+                if (cur_x == 0.0 and cur_y == 0.0) and os.path.exists(label_p):
+                    try:
+                        with open(label_p, "r") as lf:
+                            ld = json.load(lf)
+                        if isinstance(ld, dict):
+                            cur_x = float(ld.get("x", cur_x))
+                            cur_y = float(ld.get("y", cur_y))
+                            th = float(ld.get("theta", th))
+                    except Exception:
+                        pass
+                c_th, s_th = math.cos(th), math.sin(th)
+                cur_M = [[c_th, -s_th, 0.0, cur_x], [s_th, c_th, 0.0, cur_y], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+
+            x_cmd = float(cur_data.get("x_command", cur_x))
+            y_cmd = float(cur_data.get("y_command", cur_y))
+        except (KeyError, ValueError, json.JSONDecodeError, OSError):
+            return None, None, 0.0
 
         waypoints = []
-        for step in range(1, self.pred_len + 1):
-            future_file = os.path.join(label_dir, f"{frames[idx + step]}.json")
-            if os.path.exists(future_file):
-                try:
-                    with open(future_file, "r") as f:
-                        fd = json.load(f)
-                    fx = float(fd.get("x", cur_x))
-                    fy = float(fd.get("y", cur_y))
-                    # Transform world delta to ego vehicle coordinate frame
-                    dx = fx - cur_x
-                    dy = fy - cur_y
-                    cos_t = np.cos(cur_yaw)
-                    sin_t = np.sin(cur_yaw)
-                    local_x = dx * cos_t + dy * sin_t
-                    local_y = -dx * sin_t + dy * cos_t
-                    waypoints.append([local_x, local_y])
-                except Exception:
-                    waypoints.append([step * 1.5, 0.0])
-            else:
-                waypoints.append([step * 1.5, 0.0])
+        for st in strides:
+            fut_idx = idx + st
+            if fut_idx >= len(frames):
+                return None, None, 0.0
+            fut_meas_path = os.path.join(meas_dir, f"{frames[fut_idx]}.json")
+            if not os.path.exists(fut_meas_path):
+                return None, None, 0.0
 
-        target_point = waypoints[-1] if len(waypoints) > 0 else [10.0, 0.0]
-        return np.array(waypoints, dtype=np.float32), np.array(target_point, dtype=np.float32)
+            try:
+                with open(fut_meas_path, "r") as f:
+                    fut_data = json.load(f)
+                if "ego_matrix" in fut_data:
+                    fut_M = fut_data["ego_matrix"]
+                else:
+                    fut_x = float(fut_data.get("x", 0.0))
+                    fut_y = float(fut_data.get("y", 0.0))
+                    fut_th = float(fut_data.get("theta", 0.0))
+                    label_fp = os.path.join(sample_info["label_dir"], f"{frames[fut_idx]}.json")
+                    if (fut_x == 0.0 and fut_y == 0.0) and os.path.exists(label_fp):
+                        try:
+                            with open(label_fp, "r") as lf:
+                                ld = json.load(lf)
+                            if isinstance(ld, dict):
+                                fut_x = float(ld.get("x", fut_x))
+                                fut_y = float(ld.get("y", fut_y))
+                                fut_th = float(ld.get("theta", fut_th))
+                        except Exception:
+                            pass
+                    cf, sf = math.cos(fut_th), math.sin(fut_th)
+                    fut_M = [[cf, -sf, 0.0, fut_x], [sf, cf, 0.0, fut_y], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+            except (KeyError, ValueError, json.JSONDecodeError, OSError):
+                return None, None
+
+            rel_pose = transform_future_ego_pose(cur_M, fut_M)
+            waypoints.append(rel_pose)
+
+        # Transform high-level route navigation goal into ego body frame
+        target_point = transform_world_point_to_ego(cur_M, (x_cmd, y_cmd))
+        spd = float(cur_data.get("speed", 0.0))
+        sample_info["steer"] = float(cur_data.get("steer", 0.0))
+
+        # Causal kinematics from frame t and t-1
+        ax = 0.0
+        body_w = 0.0
+        if idx > 0 and len(frames) > idx:
+            prev_meas_path = os.path.join(meas_dir, f"{frames[idx - 1]}.json")
+            if os.path.exists(prev_meas_path):
+                try:
+                    with open(prev_meas_path, "r") as pf:
+                        d_prev = json.load(pf)
+                    spd_prev = float(d_prev.get("speed", spd))
+                    ax = (spd - spd_prev) / 0.5
+                    th_cur = float(cur_data.get("theta", 0.0))
+                    th_prev = float(d_prev.get("theta", th_cur))
+                    d_th = wrap_angle(th_cur - th_prev)
+                    body_w = -d_th / 0.5
+                except Exception:
+                    pass
+
+        sample_info["accel"] = float(ax)
+        sample_info["body_yaw_rate"] = float(body_w)
+        sample_info["junction"] = float(bool(cur_data.get("junction", False)))
+        sample_info["vehicle_hazard"] = float(bool(cur_data.get("vehicle_hazard", False)))
+        sample_info["light_hazard"] = float(bool(cur_data.get("light_hazard", False)))
+        sample_info["stop_sign_hazard"] = float(bool(cur_data.get("stop_sign_hazard", False)))
+
+        return np.array(waypoints, dtype=np.float32), np.array(target_point, dtype=np.float32), spd
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample_dict = super().__getitem__(idx)
         sample_info = self.samples[idx]
-        wps, target = self._load_waypoints(sample_info)
+        wps, target, spd = self._load_waypoints(sample_info)
+        if wps is None:
+            return self.__getitem__((idx + 1) % len(self))
+
+        sample_dict = super().__getitem__(idx)
+        # Ensure metadata sample alignment if cleaner recursed
+        matched_idx = sample_dict.get("metadata", {}).get("idx", idx)
+        if matched_idx != idx:
+            wps, target, spd = self._load_waypoints(self.samples[matched_idx])
+            if wps is None:
+                return self.__getitem__((matched_idx + 1) % len(self))
+
         sample_dict["waypoints"] = torch.from_numpy(wps).float()
         sample_dict["target_point"] = torch.from_numpy(target).float()
+        sample_dict["target_point_norm"] = torch.clamp(sample_dict["target_point"] / 20.0, -3.0, 3.0)
+        sample_dict["speed"] = torch.tensor([spd], dtype=torch.float32)
+        sample_dict["steer"] = torch.tensor([sample_info.get("steer", 0.0)], dtype=torch.float32)
+        sample_dict["accel"] = torch.tensor([sample_info.get("accel", 0.0)], dtype=torch.float32)
+        sample_dict["body_yaw_rate"] = torch.tensor([sample_info.get("body_yaw_rate", 0.0)], dtype=torch.float32)
+        sample_dict["x_kinematic_3d"] = torch.tensor([spd / 10.0, sample_info.get("accel", 0.0), sample_info.get("body_yaw_rate", 0.0)], dtype=torch.float32)
+        sample_dict["junction"] = torch.tensor([sample_info.get("junction", 0.0)], dtype=torch.float32)
+        sample_dict["vehicle_hazard"] = torch.tensor([sample_info.get("vehicle_hazard", 0.0)], dtype=torch.float32)
+        sample_dict["light_hazard"] = torch.tensor([sample_info.get("light_hazard", 0.0)], dtype=torch.float32)
+        sample_dict["stop_sign_hazard"] = torch.tensor([sample_info.get("stop_sign_hazard", 0.0)], dtype=torch.float32)
+        sample_dict["route_dir"] = sample_info.get("route_dir", "")
         return sample_dict
 
 

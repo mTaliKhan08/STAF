@@ -1,0 +1,58 @@
+{
+  "model_name": "STAF (Phase 1 Baseline, Unremediated, Epoch 1)",
+  "evaluation_set": "Held-Out Test Towns (Town02 & Town05, 17,447 frames)",
+  "overall": {
+    "ade_mean": 0.3883,
+    "ade_med": 0.1086,
+    "fde_mean": 0.5886,
+    "fde_med": 0.1564,
+    "lat_ade_mean": 0.0766,
+    "lat_ade_med": 0.0275,
+    "mean_l1_mean": 0.4244,
+    "mean_l1_med": 0.1412
+  },
+  "turning_steer_gt_0_05": {
+    "n_frames": 1892,
+    "ade_mean": 0.632,
+    "ade_med": 0.1935,
+    "fde_mean": 1.0664,
+    "fde_med": 0.4084,
+    "lat_ade_mean": 0.2702,
+    "lat_ade_med": 0.1422,
+    "mean_l1_mean": 0.7358,
+    "mean_l1_med": 0.2637
+  },
+  "straight_steer_le_0_05": {
+    "n_frames": 15555,
+    "ade_mean": 0.3586,
+    "ade_med": 0.104,
+    "fde_mean": 0.5305,
+    "fde_med": 0.1469,
+    "lat_ade_mean": 0.053,
+    "lat_ade_med": 0.024,
+    "mean_l1_mean": 0.3866,
+    "mean_l1_med": 0.1347
+  },
+  "inference_time_masking_ood": {
+    "unmasked_full": {
+      "ade_mean": 0.3883,
+      "fde_mean": 0.5886,
+      "lat_ade_mean": 0.0766
+    },
+    "masked_lidar": {
+      "ade_mean": 0.4017,
+      "fde_mean": 0.6075,
+      "lat_ade_mean": 0.0838
+    },
+    "masked_camera": {
+      "ade_mean": 0.5239,
+      "fde_mean": 0.8112,
+      "lat_ade_mean": 0.0926
+    },
+    "masked_kinematics": {
+      "ade_mean": 0.9034,
+      "fde_mean": 1.4878,
+      "lat_ade_mean": 0.1416
+    }
+  }
+}

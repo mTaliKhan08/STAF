@@ -73,33 +73,55 @@ STAF is benchmarked against canonical state-of-the-art baselines across their re
 
 ```text
 STAF/
+├── checkpoints/                   # Trained model checkpoints & weight matrices
+│   ├── best_model.pth             # 50-epoch checkpoint (32.8M params)
+│   └── README.md                  # Checkpoint loading guide
 ├── configs/
 │   └── default_config.py          # Master configuration (backbone, fusion, loss, training)
-├── scripts/
+├── diagnostics/                   # Pre-training and phase verification diagnostics
+│   ├── phase05_report.md          # Route alignment and temporal sanity diagnostics
+│   ├── phase05b_report.md         # Stride-1 waypoint timing validation
+│   └── real_route_fixtures.json   # Test route ground truth sanity fixtures
+├── docs/                          # Comprehensive research & examination reports
+│   └── phase1_baselines_and_remediation_report.md
+├── figures/                       # Publication & presentation visualizations
+│   ├── loss_convergence_curve.png
+│   ├── modality_attention_weights.png
+│   ├── staf_thesis_dashboard.png
+│   ├── trajectory_comparison_bev.png
+│   ├── junction_10_worst_examples.png
+│   └── demo.gif
+├── logs/                          # Training, validation & epoch progression logs
+│   ├── training_50epochs.log      # Raw 50-epoch console training log
+│   ├── original_50epochs/         # Parsed CSV & JSON loss and attention progression
+│   └── phase1_progression/        # Phase 1 epoch-by-epoch loss tracking
+├── results/                       # Empirical benchmarks & evaluation payloads
+│   ├── benchmarks/                # Master comparison tables across all models
+│   │   ├── staf_master_benchmark.csv
+│   │   └── test_baselines_recomputed.csv
+│   ├── retrained_variants/        # 3-Seed retrained ablation suite (4 variants x 3 seeds)
+│   │   ├── retrained_variants_summary.csv
+│   │   └── staf_*.json
+│   ├── phase1_unremediated/       # Initial Phase 1 checkpoint evaluation
+│   │   └── staf_phase1_unremediated_test_evaluation.json
+│   └── slices_and_controls/       # Hazard slices, dynamic speed bins & shuffled controls
+│       ├── hazard_and_dynamic_slices.csv
+│       ├── shuffled_vision_controls.csv
+│       └── comprehensive_analysis_results.json
+├── scripts/                       # Local, RunPod & Modal serverless execution scripts
+│   ├── train.py                   # Full end-to-end training loop
 │   ├── runpod_setup.sh            # Automated cloud container deployment script
-│   └── train.py                   # Full end-to-end training loop with validation
-├── staf/
+│   ├── modal_train_retrain_variants.py
+│   ├── modal_evaluate_test_and_ablations.py
+│   └── modal_comprehensive_analysis.py
+├── staf/                          # Core STAF Python library
 │   ├── baselines/                 # Adapter interfaces for baseline benchmarks
-│   │   ├── diffuser_adapter.py    # DifFUSER pipeline & logging adapter
-│   │   ├── orbslam3_runner.py     # ORB-SLAM3 trajectory execution runner
-│   │   └── transfuser_adapter.py  # TransFuser CARLA Longest6 evaluation adapter
 │   ├── data/                      # Multi-modal data loaders & preprocessing
-│   │   ├── cleaning.py            # Quality filters for camera/LiDAR/IMU
-│   │   ├── dataset.py             # nuScenes & CARLA PyTorch datasets
-│   │   └── sync.py                # Multi-rate timestamp synchronization
-│   ├── imu/
-│   │   └── preintegration.py      # On-manifold SO(3) IMU pre-integration
-│   ├── losses/
-│   │   └── focal_loss.py          # Class-balanced multi-class focal loss
-│   ├── models/
-│   │   ├── fusion_transformer.py  # Spatial cross-attention fusion layers
-│   │   ├── soft_gating.py         # Dynamic soft-gating network (1,666 params)
-│   │   ├── staf_model.py          # Master STAF neural network architecture
-│   │   └── temporal_memory.py     # Spatio-temporal FIFO memory queue
+│   ├── imu/                       # On-manifold SO(3) IMU pre-integration
+│   ├── losses/                    # Class-balanced multi-class focal loss
+│   ├── models/                    # Spatial cross-attention, soft-gating & FIFO queue
 │   └── utils/
-├── tests/
-│   ├── test_core.py               # Unit tests: SO(3), soft-gating, focal loss
-│   └── test_pipeline.py           # Unit tests: Data cleaning, sync, E2E forward pass
+├── tests/                         # Unit tests & verification suites
 ├── requirements.txt               # Python package dependencies
 ├── LICENSE                        # MIT License
 └── README.md                      # Comprehensive academic documentation
