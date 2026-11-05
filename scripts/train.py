@@ -341,8 +341,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        # Reset temporal memory at epoch boundary
-        model.reset_temporal_state(args.batch_size, device)
+        # Temporal state is reset at route boundaries, not per epoch or batch
 
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,

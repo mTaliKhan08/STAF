@@ -1,0 +1,7 @@
+{
+  "variant": "lidar_only",
+  "gate_mode": "learned",
+  "queue_length": 5,
+  "seed": 42,
+  "run_id": "group3_E_lidar_only_q5_seed42"
+}

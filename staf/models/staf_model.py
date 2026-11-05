@@ -141,6 +141,7 @@ class STAFModel(nn.Module):
         pretrained_backbones: bool = True,
         modality: str = "full",
         gate_input_dim: int = 9,
+        gate_mode: str = "learned",
         use_residual_cc: bool = False,
         use_full_kinematics_head: bool = False,
     ):
@@ -151,6 +152,7 @@ class STAFModel(nn.Module):
         self.use_ego_speed = use_ego_speed
         self.modality = modality
         self.gate_input_dim = gate_input_dim
+        self.gate_mode = gate_mode
         self.use_residual_cc = use_residual_cc
         self.use_full_kinematics_head = use_full_kinematics_head
 
@@ -171,7 +173,7 @@ class STAFModel(nn.Module):
 
         # Soft-Gating
         if self.modality == "full":
-            self.soft_gating = IMUGuidedSoftGating(input_dim=gate_input_dim, hidden_dim=64, dropout=dropout)
+            self.soft_gating = IMUGuidedSoftGating(input_dim=gate_input_dim, hidden_dim=64, dropout=dropout, gate_mode=gate_mode)
             self.fusion_transformer = GatedFusionTransformer(embed_dim=embed_dim, num_heads=num_heads, num_layers=num_fusion_layers, ff_dim=ff_dim, dropout=dropout)
         else:
             self.soft_gating = None

@@ -20,6 +20,8 @@ Each sample returns:
 import os
 import re
 import random
+import collections
+from typing import Any
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -873,16 +875,16 @@ class CARLASTAFDataset(STAFDataset):
             x_cmd = float(cur_data.get("x_command", cur_x))
             y_cmd = float(cur_data.get("y_command", cur_y))
         except (KeyError, ValueError, json.JSONDecodeError, OSError):
-            return None, None, 0.0
+            return None, None, 0.0, None
 
         waypoints = []
         for st in strides:
             fut_idx = idx + st
             if fut_idx >= len(frames):
-                return None, None, 0.0
+                return None, None, 0.0, None
             fut_meas_path = os.path.join(meas_dir, f"{frames[fut_idx]}.json")
             if not os.path.exists(fut_meas_path):
-                return None, None, 0.0
+                return None, None, 0.0, None
 
             try:
                 with open(fut_meas_path, "r") as f:
@@ -907,7 +909,7 @@ class CARLASTAFDataset(STAFDataset):
                     cf, sf = math.cos(fut_th), math.sin(fut_th)
                     fut_M = [[cf, -sf, 0.0, fut_x], [sf, cf, 0.0, fut_y], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
             except (KeyError, ValueError, json.JSONDecodeError, OSError):
-                return None, None
+                return None, None, 0.0, None
 
             rel_pose = transform_future_ego_pose(cur_M, fut_M)
             waypoints.append(rel_pose)
@@ -942,11 +944,11 @@ class CARLASTAFDataset(STAFDataset):
         sample_info["light_hazard"] = float(bool(cur_data.get("light_hazard", False)))
         sample_info["stop_sign_hazard"] = float(bool(cur_data.get("stop_sign_hazard", False)))
 
-        return np.array(waypoints, dtype=np.float32), np.array(target_point, dtype=np.float32), spd
+        return np.array(waypoints, dtype=np.float32), np.array(target_point, dtype=np.float32), spd, np.array(cur_M, dtype=np.float32)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample_info = self.samples[idx]
-        wps, target, spd = self._load_waypoints(sample_info)
+        wps, target, spd, cur_M = self._load_waypoints(sample_info)
         if wps is None:
             return self.__getitem__((idx + 1) % len(self))
 
@@ -954,7 +956,7 @@ class CARLASTAFDataset(STAFDataset):
         # Ensure metadata sample alignment if cleaner recursed
         matched_idx = sample_dict.get("metadata", {}).get("idx", idx)
         if matched_idx != idx:
-            wps, target, spd = self._load_waypoints(self.samples[matched_idx])
+            wps, target, spd, cur_M = self._load_waypoints(self.samples[matched_idx])
             if wps is None:
                 return self.__getitem__((matched_idx + 1) % len(self))
 
@@ -970,7 +972,11 @@ class CARLASTAFDataset(STAFDataset):
         sample_dict["vehicle_hazard"] = torch.tensor([sample_info.get("vehicle_hazard", 0.0)], dtype=torch.float32)
         sample_dict["light_hazard"] = torch.tensor([sample_info.get("light_hazard", 0.0)], dtype=torch.float32)
         sample_dict["stop_sign_hazard"] = torch.tensor([sample_info.get("stop_sign_hazard", 0.0)], dtype=torch.float32)
+        sample_dict["ego_matrix"] = torch.from_numpy(cur_M).float()
         sample_dict["route_dir"] = sample_info.get("route_dir", "")
+        sample_dict["route_id"] = os.path.basename(sample_info.get("route_dir", "")) or sample_info.get("route_dir", "")
+        sample_dict["frame_id"] = str(sample_info.get("frame_id", ""))
+        sample_dict["frame_idx"] = torch.tensor(sample_info.get("frame_idx", 0), dtype=torch.long)
         return sample_dict
 
 
@@ -1046,3 +1052,86 @@ class KITTI360Dataset(STAFDataset):
             "timestamps": np.linspace(0, 0.1, 20),
             "expected_dt_ms": 5.0,
         }
+
+
+
+class RouteOrderedBatchSampler(torch.utils.data.Sampler):
+    """
+    Route-Ordered Batch Sampler for sequential multi-frame training.
+
+    Shuffles routes (not individual frames).
+    Each batch consists of B parallel routes.
+    Iterates frames 0..L-1 in strict chronological order within the batch of routes,
+    carrying temporal memory queue across steps.
+    Resets at route boundaries.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        batch_size: int = 4,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        # Build route_to_indices mapping from dataset.samples
+        self.route_to_indices = collections.defaultdict(list)
+        for idx, sample in enumerate(dataset.samples):
+            r_key = sample.get("route_dir") or sample.get("route_id", "route_0")
+            self.route_to_indices[r_key].append(idx)
+
+        # Sort indices within each route to guarantee chronological sequence
+        for r_key in self.route_to_indices:
+            self.route_to_indices[r_key].sort()
+
+        self.route_keys = sorted(list(self.route_to_indices.keys()))
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        # Sort routes by length so parallel routes in each batch have matching lengths
+        routes = sorted(self.route_keys, key=lambda r: len(self.route_to_indices[r]))
+
+        # Group routes into chunks of size B
+        route_chunks = [routes[i:i + self.batch_size] for i in range(0, len(routes), self.batch_size)]
+        if self.drop_last and len(route_chunks) > 0 and len(route_chunks[-1]) < self.batch_size:
+            route_chunks = route_chunks[:-1]
+
+        # Randomize chunk execution order across epochs
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(route_chunks)
+
+        for chunk in route_chunks:
+            chunk_indices = [self.route_to_indices[r] for r in chunk]
+            max_len = max(len(idxs) for idxs in chunk_indices) if chunk_indices else 0
+
+            for t in range(max_len):
+                batch = []
+                for idxs in chunk_indices:
+                    # If route is shorter than max_len, repeat the last frame
+                    idx = idxs[t] if t < len(idxs) else idxs[-1]
+                    batch.append(idx)
+                yield batch
+
+    def __len__(self):
+        routes = list(self.route_keys)
+        route_chunks = [routes[i:i + self.batch_size] for i in range(0, len(routes), self.batch_size)]
+        if self.drop_last and len(route_chunks) > 0 and len(route_chunks[-1]) < self.batch_size:
+            route_chunks = route_chunks[:-1]
+
+        total_batches = 0
+        for chunk in route_chunks:
+            chunk_indices = [self.route_to_indices[r] for r in chunk]
+            max_len = max(len(idxs) for idxs in chunk_indices) if chunk_indices else 0
+            total_batches += max_len
+        return total_batches

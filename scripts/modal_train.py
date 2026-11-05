@@ -368,7 +368,7 @@ def train_staf(
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
         model.train()
-        model.reset_temporal_state(batch_size, device)
+        # Temporal state is reset at route boundaries, not per epoch or batch
 
         total_loss = 0.0
         total_samples = 0

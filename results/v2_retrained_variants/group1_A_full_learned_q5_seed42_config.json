@@ -1,0 +1,7 @@
+{
+  "variant": "full",
+  "gate_mode": "learned",
+  "queue_length": 5,
+  "seed": 42,
+  "run_id": "group1_A_full_learned_q5_seed42"
+}

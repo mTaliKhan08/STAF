@@ -1,0 +1,7 @@
+{
+  "variant": "no_vision",
+  "gate_mode": "learned",
+  "queue_length": 5,
+  "seed": 42,
+  "run_id": "group3_F_no_vision_q5_seed42"
+}

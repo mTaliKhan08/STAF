@@ -36,7 +36,7 @@ except ImportError:
 try:
     import carla
     VehicleControl = carla.VehicleControl
-except ImportError:
+except (ImportError, AttributeError):
     class VehicleControl:
         """Lightweight VehicleControl mock for headless/offline testing."""
         def __init__(self, steer: float = 0.0, throttle: float = 0.0, brake: float = 0.0, hand_brake: bool = False, reverse: bool = False):
