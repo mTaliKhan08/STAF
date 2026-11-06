@@ -117,42 +117,51 @@ def sync_with_rclone(rclone_conf_str: str, datasets: list):
         os.makedirs(target_dir, exist_ok=True)
 
         print(f"\n========================================================")
-        print(f">> Syncing {ds_key.upper()} from {remote_src}...")
+        print(f">> Syncing {ds_key.upper()} from {remote_src} (Archive-by-Archive Streaming)...")
         print(f"========================================================")
 
-        cmd = [
-            "rclone", "copy", remote_src, dest_archive_dir,
-            "--progress",
-            "--transfers", "8",
-            "--checkers", "16",
-            "--drive-chunk-size", "128M"
+        # List archives on remote
+        list_cmd = ["rclone", "lsf", remote_src]
+        res_list = subprocess.run(list_cmd, capture_output=True, text=True)
+        archive_files = [
+            f.strip() for f in res_list.stdout.splitlines()
+            if f.strip().endswith(".zip") or ".tar" in f.strip() or f.strip().endswith(".tgz")
         ]
-        res = subprocess.run(cmd)
-        if res.returncode != 0:
-            print(f"[ERROR] rclone failed for {ds_key}")
-            continue
+        print(f">> Found {len(archive_files)} archives for {ds_key}: {archive_files}")
 
-        print(f">> Extracting {ds_key.upper()} archives into {target_dir}...")
-        if archive_type == "tar":
-            # Extract tar/tgz/tar.gz files
-            subprocess.run(
-                f"for f in {dest_archive_dir}/*.tar* {dest_archive_dir}/*.tgz; do "
-                f"[ -f \"$f\" ] && echo \"Extracting $f...\" && tar xf \"$f\" -C {target_dir}; "
-                f"done",
-                shell=True
-            )
-        elif archive_type == "zip":
-            subprocess.run(
-                f"for f in {dest_archive_dir}/*.zip; do "
-                f"[ -f \"$f\" ] && echo \"Extracting $f...\" && unzip -q -o \"$f\" -d {target_dir}; "
-                f"done",
-                shell=True
-            )
+        for i, arc in enumerate(archive_files, 1):
+            remote_file = f"{remote_src.rstrip('/')}/{arc}"
+            local_arc_path = os.path.join(dest_archive_dir, arc)
+            print(f"\n[{i}/{len(archive_files)}] Downloading {arc} from {remote_file}...")
+            copy_cmd = [
+                "rclone", "copyto", remote_file, local_arc_path,
+                "--progress",
+                "--drive-chunk-size", "128M"
+            ]
+            res_c = subprocess.run(copy_cmd)
+            if res_c.returncode != 0:
+                print(f"[ERROR] Failed to download {arc}")
+                continue
+
+            print(f"[{i}/{len(archive_files)}] Extracting {arc} into {target_dir}...")
+            if arc.endswith(".zip"):
+                ext_cmd = f"unzip -q -o \"{local_arc_path}\" -d \"{target_dir}\""
+            else:
+                ext_cmd = f"tar xf \"{local_arc_path}\" -C \"{target_dir}\""
+            res_e = subprocess.run(ext_cmd, shell=True)
+            if res_e.returncode != 0:
+                print(f"[WARN] Extraction exited with code {res_e.returncode} for {arc}")
+
+            # Remove downloaded archive to preserve disk space within volume limit
+            if os.path.exists(local_arc_path):
+                os.remove(local_arc_path)
+            print(f"[{i}/{len(archive_files)}] Cleaned up {arc}. Committing volume...")
+            data_volume.commit()
 
         print(f"[PASS] {ds_key.upper()} ready at {target_dir}")
 
-    # Commit persistent changes to the Modal volume
-    print(">> Committing changes to Modal persistent volume...")
+    # Final commit and status
+    print(">> All datasets processed. Finalizing persistent volume...")
     data_volume.commit()
     print(">> Data volume successfully committed and permanently saved.")
 
