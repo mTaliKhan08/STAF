@@ -29,8 +29,8 @@ import numpy as np
 
 app = modal.App("staf-v2-training-suite")
 
-data_volume = modal.Volume.from_name("staf-datasets")
-checkpoint_volume = modal.Volume.from_name("staf-checkpoints")
+data_volume = modal.Volume.from_name("staf-datasets", create_if_missing=True)
+checkpoint_volume = modal.Volume.from_name("staf-checkpoints", create_if_missing=True)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if os.path.exists("/root/STAF"):
