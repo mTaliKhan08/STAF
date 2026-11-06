@@ -77,15 +77,17 @@ def inspect_volume():
 @app.function(
     image=data_engine_image,
     volumes={"/data": data_volume},
-    timeout=14400,
+    timeout=86400,  # Up to 24 hours for complete dataset ingestion & extraction
     cpu=4.0,
     memory=16384,
 )
 def sync_with_rclone(rclone_conf_str: str, datasets: list):
     """
     Sync datasets from Google Drive using rclone and extract on the volume.
+    Tracks completed archives in a manifest file to allow seamless resumption.
     """
     import subprocess
+    import shutil
 
     # Write rclone config inside the remote container
     rclone_dir = "/root/.config/rclone"
@@ -116,8 +118,17 @@ def sync_with_rclone(rclone_conf_str: str, datasets: list):
         os.makedirs(dest_archive_dir, exist_ok=True)
         os.makedirs(target_dir, exist_ok=True)
 
+        # Manifest to track completed archives
+        manifest_path = os.path.join(target_dir, ".completed_archives.txt")
+        completed = set()
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r") as f:
+                completed = set(line.strip() for line in f if line.strip())
+
         print(f"\n========================================================")
-        print(f">> Syncing {ds_key.upper()} from {remote_src} (Archive-by-Archive Streaming)...")
+        print(f">> Syncing {ds_key.upper()} from {remote_src}")
+        print(f">> Target directory: {target_dir}")
+        print(f">> Previously completed: {len(completed)} archives")
         print(f"========================================================")
 
         # List archives on remote
@@ -127,16 +138,20 @@ def sync_with_rclone(rclone_conf_str: str, datasets: list):
             f.strip() for f in res_list.stdout.splitlines()
             if f.strip().endswith(".zip") or ".tar" in f.strip() or f.strip().endswith(".tgz")
         ]
-        print(f">> Found {len(archive_files)} archives for {ds_key}: {archive_files}")
+        print(f">> Found {len(archive_files)} remote archives for {ds_key}: {archive_files}")
 
         for i, arc in enumerate(archive_files, 1):
+            if arc in completed:
+                print(f"[{i}/{len(archive_files)}] {arc} is already extracted, skipping.")
+                continue
+
             remote_file = f"{remote_src.rstrip('/')}/{arc}"
             local_arc_path = os.path.join(dest_archive_dir, arc)
             print(f"\n[{i}/{len(archive_files)}] Downloading {arc} from {remote_file}...")
             copy_cmd = [
                 "rclone", "copyto", remote_file, local_arc_path,
                 "--progress",
-                "--drive-chunk-size", "128M"
+                "--drive-chunk-size", "256M"
             ]
             res_c = subprocess.run(copy_cmd)
             if res_c.returncode != 0:
@@ -152,13 +167,29 @@ def sync_with_rclone(rclone_conf_str: str, datasets: list):
             if res_e.returncode != 0:
                 print(f"[WARN] Extraction exited with code {res_e.returncode} for {arc}")
 
-            # Remove downloaded archive to preserve disk space within volume limit
+            # Remove downloaded archive immediately to preserve volume space
             if os.path.exists(local_arc_path):
                 os.remove(local_arc_path)
-            print(f"[{i}/{len(archive_files)}] Cleaned up {arc}. Committing volume...")
+
+            # Record in manifest and commit persistent volume
+            with open(manifest_path, "a") as f:
+                f.write(f"{arc}\n")
+            completed.add(arc)
+
+            print(f"[{i}/{len(archive_files)}] Successfully processed {arc}. Committing volume...")
             data_volume.commit()
 
-        print(f"[PASS] {ds_key.upper()} ready at {target_dir}")
+            # Report volume status
+            res_df = subprocess.run(["df", "-h", "/data"], capture_output=True, text=True)
+            print(res_df.stdout.strip())
+
+        # Clean up temporary archive folder
+        if os.path.exists(dest_archive_dir):
+            shutil.rmtree(dest_archive_dir, ignore_errors=True)
+
+        # Count total discovered routes
+        route_count = sum(1 for root, dirs, _ in os.walk(target_dir) if "rgb" in dirs)
+        print(f"\n[PASS] {ds_key.upper()} ingestion complete! Discovered {route_count} route directories at {target_dir}.")
 
     # Final commit and status
     print(">> All datasets processed. Finalizing persistent volume...")
